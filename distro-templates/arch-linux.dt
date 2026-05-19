@@ -1,0 +1,178 @@
+[DistroInfo]
+DistroName = "Arch Linux"
+Arch = "x64"
+Description = "Arch Linux for mkmelinux."
+Supporting = ["ISO", "HARDDISK"]
+
+[ContainerConfig]
+Packages = ["curl", "zstd"]
+
+[DistroConfig]
+Download-Rootfs-Cmd = '''
+lastarchver=$(curl https://archive.archlinux.org/iso/ | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}' | tail -n 1)
+curl -O https://archive.archlinux.org/iso/${lastarchver}/archlinux-bootstrap-x86_64.tar.zst
+unzstd archlinux-bootstrap-x86_64.tar.zst
+mkdir tmp-extract
+tar -xvf ./archlinux-bootstrap-x86_64.tar -C ./tmp-extract
+mv ./tmp-extract/root.x86_64 ./rootfs
+rm -rf ./tmp-extract
+'''
+
+# pacman requires the rootfs to be a mountpoint, /proc for process info,
+# /dev for GnuPG entropy (pacman-key --init reads /dev/urandom), and
+# resolv.conf so DNS works inside the chroot. Mirrors ship commented out
+# in the bootstrap tarball, so we uncomment them before keying.
+# pacman-key must run inside the chroot — the build container is Debian
+# and does not have pacman-key on its own PATH.
+Setup-Chroot-Cmd = '''
+mount --bind ./rootfs ./rootfs
+mount -t proc none ./rootfs/proc
+mount --bind /sys ./rootfs/sys
+mount --bind /dev ./rootfs/dev
+mount --bind /dev/pts ./rootfs/dev/pts
+mount --bind /etc/resolv.conf ./rootfs/etc/resolv.conf
+sed -i 's/^#Server/Server/' ./rootfs/etc/pacman.d/mirrorlist
+chroot ./rootfs pacman-key --init
+chroot ./rootfs pacman-key --populate archlinux
+'''
+
+Exit-Chroot-Cmd = '''
+umount ./rootfs/etc/resolv.conf
+umount ./rootfs/dev/pts
+umount ./rootfs/dev
+umount ./rootfs/sys
+umount ./rootfs/proc
+umount ./rootfs
+'''
+
+# Packages needed to produce a bootable squashfs ISO (BIOS + UEFI via grub).
+ISO-Install-Base-Packages-Cmd = "pacman -Sy --noconfirm linux grub squashfs-tools dhcpcd busybox"
+
+# Packages needed for a UEFI virtual-machine disk image.
+HARDDISK-Install-Base-Packages-Cmd = "pacman -Sy --noconfirm linux grub efibootmgr"
+
+# Arch uses mkinitcpio, not update-initramfs.
+Regenerate-Initramfs-Cmd = "mkinitcpio -P || true"
+
+# Install a minimal live boot hook so the initramfs can find the squashfs on
+# the ISO, set up an overlayfs writable layer, and switch root into it.
+# The standard Arch initramfs only knows how to boot from a real disk partition.
+ISO-Pre-Initramfs-Cmd = '''
+mkdir -p /etc/initcpio/hooks /etc/initcpio/install
+
+cat > /etc/initcpio/hooks/mklive << 'HOOK_EOF'
+run_hook() {
+    local img="/live/rootfs.squashfs"
+    mkdir -p /run/mklive/medium /run/mklive/rootfs /run/mklive/overlay
+
+    # Read the ISO volume label from kernel cmdline (set by the GRUB entry).
+    # Use /dev/disk/by-label/ — a udev symlink — exactly as the real archiso
+    # mkinitcpio hook does. blkid is not needed and unreliable here.
+    local label="MKLIVE"
+    for _p in $(cat /proc/cmdline); do
+        case "$_p" in mklive.label=*) label="${_p#mklive.label=}";; esac
+    done
+
+    echo "mklive: looking for label='${label}' img='${img}'"
+    echo "mklive: kernel cmdline: $(cat /proc/cmdline)"
+
+    local dev="/dev/disk/by-label/${label}"
+    local found="" retries=0
+    while [ -z "$found" ] && [ "$retries" -lt 30 ]; do
+        echo "mklive: attempt $((retries + 1))/30"
+        echo "mklive: /dev/disk/by-label: $(ls /dev/disk/by-label/ 2>&1)"
+        echo "mklive: block devices: $(ls /dev/sr* /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null | tr '\n' ' ')"
+
+        # Primary: find by udev volume-label symlink.
+        if [ -b "$dev" ]; then
+            echo "mklive: trying by-label device ${dev}..."
+            if mount -r "$dev" /run/mklive/medium 2>/dev/null; then
+                if [ -f "/run/mklive/medium${img}" ]; then
+                    echo "mklive: found squashfs via by-label"
+                    found="$dev"
+                else
+                    echo "mklive: mounted ${dev} but no squashfs — contents: $(ls /run/mklive/medium/ 2>&1)"
+                    umount /run/mklive/medium 2>/dev/null
+                fi
+            else
+                echo "mklive: mount of ${dev} failed"
+            fi
+        fi
+
+        # Fallback: scan raw CD-ROM device nodes directly.
+        if [ -z "$found" ]; then
+            for rawdev in /dev/sr0 /dev/sr1 /dev/sr2 /dev/sda /dev/sdb /dev/vda; do
+                [ -b "$rawdev" ] || continue
+                echo "mklive: trying raw device ${rawdev}..."
+                if mount -r "$rawdev" /run/mklive/medium 2>/dev/null; then
+                    if [ -f "/run/mklive/medium${img}" ]; then
+                        echo "mklive: found squashfs on ${rawdev}"
+                        found="$rawdev"
+                        break
+                    else
+                        echo "mklive: ${rawdev} mounted but no squashfs — contents: $(ls /run/mklive/medium/ 2>&1)"
+                        umount /run/mklive/medium 2>/dev/null
+                    fi
+                fi
+            done
+        fi
+
+        [ -z "$found" ] && { retries=$((retries + 1)); sleep 1; }
+    done
+
+    if [ -z "$found" ]; then
+        echo "mklive: ERROR: boot medium not found after 30 attempts" >&2
+        echo "mklive: final /dev/disk/by-label: $(ls /dev/disk/by-label/ 2>&1)" >&2
+        echo "mklive: final /dev: $(ls /dev/ | grep -E '^(sd|sr|vd|nvme|loop)' | tr '\n' ' ')" >&2
+        return 1
+    fi
+
+    echo "mklive: mounting squashfs from /run/mklive/medium${img}..."
+    mount -r -t squashfs "/run/mklive/medium${img}" /run/mklive/rootfs
+    echo "mklive: preparing overlay tmpfs..."
+    mount -t tmpfs tmpfs /run/mklive/overlay
+    mkdir -p /run/mklive/overlay/upper /run/mklive/overlay/work
+
+    # Override mkinitcpio's default mount_handler. The init script calls
+    # "${mount_handler}" /new_root *after* hooks finish — its default would
+    # try to mount $root (empty for us) onto /new_root, clobbering anything
+    # we already mounted there. Pointing mount_handler at our own function is
+    # the supported way to take over the root mount.
+    mount_handler="mklive_mount_handler"
+    echo "mklive: hook done, mount_handler set."
+}
+
+mklive_mount_handler() {
+    local newroot="$1"
+    echo "mklive: mount_handler mounting overlay on ${newroot}..."
+    mount -t overlay overlay \
+        -o lowerdir=/run/mklive/rootfs,upperdir=/run/mklive/overlay/upper,workdir=/run/mklive/overlay/work \
+        "$newroot"
+    echo "mklive: overlay mounted on ${newroot}, switching root."
+}
+HOOK_EOF
+
+cat > /etc/initcpio/install/mklive << 'INSTALL_EOF'
+build() {
+    add_module loop
+    add_module squashfs
+    add_module overlay
+    add_module iso9660
+    add_runscript
+}
+INSTALL_EOF
+
+# Drop autodetect — in a build chroot it only whitelists modules loaded on the
+# host, so sr_mod (CD-ROM driver) and iso9660 never make it into the initramfs.
+# Without autodetect the block hook includes ALL block device drivers, which is
+# what a live ISO needs since it must be able to boot on any hardware.
+# Explicitly list the filesystem modules since block hook does not cover those.
+systemctl enable dhcpcd
+
+sed -i 's/^MODULES=.*/MODULES=(loop squashfs overlay iso9660 sr_mod sd_mod)/' /etc/mkinitcpio.conf
+sed -i 's/^HOOKS=.*/HOOKS=(base udev modconf block mklive)/' /etc/mkinitcpio.conf
+'''
+
+# Arch names its kernel and initramfs differently from Debian.
+Vmlinuz-Name = "vmlinuz-linux"
+Initramfs-Name = "initramfs-linux.img"

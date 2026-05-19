@@ -1,0 +1,1 @@
+GENERATE_HOSTNAME=mylinux TYPE=ISO CONFIGDIR=/env/distro 
