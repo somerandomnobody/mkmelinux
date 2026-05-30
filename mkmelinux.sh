@@ -15,14 +15,24 @@
 # SKIP_BOOT_MARKER   - if "YES", skip the V86 ready marker (for custom markers in extrachrootsteps)
 # EMERG_CHROOT       - path to a rootfs to chroot into (skips the normal build entirely)
 # EMERG_CHROOT_CMD   - command to run inside the chroot (default: /bin/sh)
+# DT.<VAR>=<VALUE>   - pass a variable to the distro template; available as $VAR in all
+#                      template commands (both build container and chroot). Use underscores,
+#                      not hyphens, in variable names. Example: DT.DROIDOS_TYPE=ANDROIDTV
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
+
+declare -A _DT_VARS=()
 
 for arg in "$@"; do
     if [[ "$arg" == *"="* ]]; then
         key="${arg%%=*}"
         value="${arg#*=}"
-        declare "$key=$value"
+        if [[ "$key" == DT.* ]]; then
+            dtkey="${key#DT.}"
+            _DT_VARS["$dtkey"]="$value"
+        else
+            declare "$key=$value"
+        fi
     fi
 done
 
@@ -128,14 +138,77 @@ _toml_validate() {
 dt() { echo "${_toml[$1]:-}"; }
 dt_has() { [[ -n "${_toml[$1]:-}" ]]; }
 
+# Emit export statements for all DT. variables so they can be prepended to
+# any bash -c string or script file that runs inside or outside the chroot.
+_dt_exports() {
+    local out=""
+    for v in "${!_DT_VARS[@]}"; do
+        out+="export $(printf '%s=%q' "$v" "${_DT_VARS[$v]}"); "
+    done
+    printf '%s' "$out"
+}
+
 # Run a block of shell commands from a template key as root from the current directory.
+# DT. variables are prepended as exports so templates can read them.
+# Returns the exit code of the script.
 _run_template_cmd() {
-    local content="$1"
+    local content="$1" rc
     local tmp
     tmp=$(mktemp /tmp/mkmelinux-XXXXXX.sh)
-    printf '%s\n' "$content" > "$tmp"
-    $SUDO bash "$tmp"
+    {
+        for v in "${!_DT_VARS[@]}"; do
+            printf 'export %s=%q\n' "$v" "${_DT_VARS[$v]}"
+        done
+        printf '%s\n' "$content"
+    } > "$tmp"
+    $SUDO bash "$tmp" && rc=0 || rc=$?
     rm -f "$tmp"
+    return $rc
+}
+
+# Run a named template step outside the chroot.
+# Prints step start/success/failure and exits the build on failure.
+_run_step() {
+    local name="$1" content="$2"
+    echo "${GREEN}[INFO]${RESET} step ${name} starting"
+    if _run_template_cmd "$content"; then
+        echo "${GREEN}[INFO]${RESET} step ${name} succeeded"
+    else
+        echo "${RED}[ ERR ]${RESET} step ${name} failed! Command was:"
+        echo "---"
+        printf '%s\n' "$content"
+        echo "---"
+        exit 1
+    fi
+}
+
+# Run a named template step inside the chroot.
+# Copies the script into the rootfs, chrootexecutes it, then removes it.
+# Exits the build on failure.
+_run_chroot_step() {
+    local name="$1" content="$2"
+    echo "${GREEN}[INFO]${RESET} step ${name} starting"
+    local tmp
+    tmp=$(mktemp /tmp/mkmelinux-XXXXXX.sh)
+    {
+        for v in "${!_DT_VARS[@]}"; do
+            printf 'export %s=%q\n' "$v" "${_DT_VARS[$v]}"
+        done
+        printf '%s\n' "$content"
+    } > "$tmp"
+    $SUDO cp "$tmp" ./rootfs/_step.sh
+    rm -f "$tmp"
+    if $SUDO chroot ./rootfs bash -c "PATH=$PATH:/usr/sbin bash /_step.sh"; then
+        echo "${GREEN}[INFO]${RESET} step ${name} succeeded"
+    else
+        echo "${RED}[ ERR ]${RESET} step ${name} failed! Command was:"
+        echo "---"
+        printf '%s\n' "$content"
+        echo "---"
+        $SUDO rm -f ./rootfs/_step.sh
+        exit 1
+    fi
+    $SUDO rm -f ./rootfs/_step.sh
 }
 
 if [[ -n "${OSTEMPLATE:-}" ]]; then
@@ -207,23 +280,23 @@ else
     $SUDO echo "Sudo access granted"
 fi
 
-# ── Teardown trap ─────────────────────────────────────────────────────────────
+# ── Exit-Chroot-Cmd trap ──────────────────────────────────────────────────────
 # If Setup-Chroot-Cmd ran, Exit-Chroot-Cmd must run on exit — even on error.
 
-_TEARDOWN_CONTENT=""
-_teardown_done=0
-_teardown_on_exit() {
-    if [[ -n "$_TEARDOWN_CONTENT" ]] && (( ! _teardown_done )); then
-        _teardown_done=1
-        echo "${YELLOW}[WARN]${RESET} Running chroot teardown (cleanup on exit)..."
+_EXIT_CONTENT=""
+_exit_done=0
+_on_exit_cleanup() {
+    if [[ -n "$_EXIT_CONTENT" ]] && (( ! _exit_done )); then
+        _exit_done=1
+        echo "${YELLOW}[WARN]${RESET} Running Exit-Chroot-Cmd on exit..."
         local tmp
-        tmp=$(mktemp /tmp/mkmelinux-teardown-XXXXXX.sh)
-        printf '%s\n' "$_TEARDOWN_CONTENT" > "$tmp"
+        tmp=$(mktemp /tmp/mkmelinux-exit-XXXXXX.sh)
+        printf '%s\n' "$_EXIT_CONTENT" > "$tmp"
         $SUDO bash "$tmp" || true
         rm -f "$tmp"
     fi
 }
-trap '_teardown_on_exit' EXIT
+trap '_on_exit_cleanup' EXIT
 
 # ── Clean old artifacts ───────────────────────────────────────────────────────
 
@@ -248,8 +321,7 @@ fi
 
 if [[ "${GENERATE_NEW_ROOTFS:-}" == "YES" ]] || ! [[ -d ./rootfs ]]; then
     if (( USING_TEMPLATE )); then
-        echo "${GREEN}[INFO]${RESET} Downloading rootfs via distro template (${OSTEMPLATE})..."
-        _run_template_cmd "$(dt "DistroConfig.Download-Rootfs-Cmd")"
+        _run_step "Download-Rootfs-Cmd" "$(dt "DistroConfig.Download-Rootfs-Cmd")"
     else
         echo "${GREEN}[INFO]${RESET} Getting Debian rootfs, please wait..."
         ARCH_FLAG=""
@@ -277,11 +349,9 @@ $SUDO chroot ./rootfs bash -c "rm /etc/hostname && echo ${GENERATE_HOSTNAME} >> 
 # distro's package manager works correctly inside the chroot.
 
 if (( USING_TEMPLATE )) && dt_has "DistroConfig.Setup-Chroot-Cmd"; then
-    echo "${GREEN}[INFO]${RESET} Setting up chroot environment (${OSTEMPLATE})..."
-    _run_template_cmd "$(dt "DistroConfig.Setup-Chroot-Cmd")"
-    # Register teardown content so the trap can clean up on failure.
+    _run_step "Setup-Chroot-Cmd" "$(dt "DistroConfig.Setup-Chroot-Cmd")"
     if dt_has "DistroConfig.Exit-Chroot-Cmd"; then
-        _TEARDOWN_CONTENT="$(dt "DistroConfig.Exit-Chroot-Cmd")"
+        _EXIT_CONTENT="$(dt "DistroConfig.Exit-Chroot-Cmd")"
     fi
 fi
 
@@ -291,7 +361,7 @@ echo "${GREEN}[INFO]${RESET} Installing base packages..."
 if (( USING_TEMPLATE )); then
     _pkg_key="DistroConfig.${TYPE}-Install-Base-Packages-Cmd"
     if dt_has "$_pkg_key"; then
-        $SUDO chroot ./rootfs bash -c "PATH=$PATH:/usr/sbin $(dt "$_pkg_key")"
+        _run_chroot_step "${TYPE}-Install-Base-Packages-Cmd" "$(dt "$_pkg_key")"
     else
         echo "${YELLOW}[WARN]${RESET} Template has no ${TYPE}-Install-Base-Packages-Cmd — skipping base package install."
     fi
@@ -397,26 +467,36 @@ else
     echo "${YELLOW}[WARN]${RESET} globalpatches directory not found!"
 fi
 
+# ── Post-ExtraChrootSteps-Cmd (template only) ─────────────────────────────────
+# Runs inside the chroot after extrachrootsteps.sh and globalpatches have been
+# applied. At this point extracustomization files are already in the rootfs, so
+# templates can inspect or act on user-supplied content (e.g. pre-placed APKs).
+
+if (( USING_TEMPLATE )) && dt_has "DistroConfig.Post-ExtraChrootSteps-Cmd"; then
+    _run_chroot_step "Post-ExtraChrootSteps-Cmd" "$(dt "DistroConfig.Post-ExtraChrootSteps-Cmd")"
+fi
+
 # ── Pre-initramfs template step (type-specific) ───────────────────────────────
 # Lets templates configure the initramfs environment (e.g. install live boot
 # hooks) before mkinitcpio / update-initramfs runs.
 
 _pre_initramfs_key="DistroConfig.${TYPE}-Pre-Initramfs-Cmd"
 if (( USING_TEMPLATE )) && dt_has "$_pre_initramfs_key"; then
-    echo "${GREEN}[INFO]${RESET} Running pre-initramfs setup (${OSTEMPLATE}, ${TYPE})..."
-    _pre_tmp=$(mktemp /tmp/mkmelinux-XXXXXX.sh)
-    dt "$_pre_initramfs_key" > "$_pre_tmp"
-    $SUDO cp "$_pre_tmp" ./rootfs/_pre_initramfs.sh
-    rm -f "$_pre_tmp"
-    $SUDO chroot ./rootfs bash -c "PATH=$PATH:/usr/sbin bash /_pre_initramfs.sh"
-    $SUDO rm -f ./rootfs/_pre_initramfs.sh
+    _run_chroot_step "${TYPE}-Pre-Initramfs-Cmd" "$(dt "$_pre_initramfs_key")"
 fi
 
 # ── Regenerate initramfs ──────────────────────────────────────────────────────
 
 echo "${GREEN}[INFO]${RESET} Regenerating initramfs..."
 if (( USING_TEMPLATE )) && dt_has "DistroConfig.Regenerate-Initramfs-Cmd"; then
-    $SUDO chroot ./rootfs bash -c "PATH=$PATH:/usr/sbin $(dt "DistroConfig.Regenerate-Initramfs-Cmd")" || true # Safe enough to assume this will fail inside a chroot. This is fine since a chroot will not act entirely like a real environment.
+    echo "${GREEN}[INFO]${RESET} step Regenerate-Initramfs-Cmd starting"
+    # Errors are warnings here — initramfs tools often exit non-zero in a chroot
+    # due to missing /dev/console, kernel modules not matching the host, etc.
+    if $SUDO chroot ./rootfs bash -c "PATH=$PATH:/usr/sbin $(_dt_exports)$(dt "DistroConfig.Regenerate-Initramfs-Cmd")"; then
+        echo "${GREEN}[INFO]${RESET} step Regenerate-Initramfs-Cmd succeeded"
+    else
+        echo "${YELLOW}[WARN]${RESET} step Regenerate-Initramfs-Cmd exited non-zero (may be normal in a chroot)"
+    fi
 else
     $SUDO chroot ./rootfs bash -c "PATH=$PATH:/usr/sbin update-initramfs -u"
 fi
@@ -426,12 +506,14 @@ if [[ $TYPE == "V86" ]]; then
     $SUDO chroot ./rootfs bash -c "mv /boot/vmlinuz-* /boot/vmlinuz-linux && mv /boot/initrd.img-* /boot/initramfs-linux.img"
 fi
 
-# ── Teardown chroot environment (template only) ───────────────────────────────
+# ── Exit-Chroot-Cmd (template only) ──────────────────────────────────────────
 
-if [[ -n "$_TEARDOWN_CONTENT" ]]; then
-    echo "${GREEN}[INFO]${RESET} Tearing down chroot environment..."
-    _run_template_cmd "$_TEARDOWN_CONTENT" || true
-    _teardown_done=1
+if [[ -n "$_EXIT_CONTENT" ]]; then
+    echo "${GREEN}[INFO]${RESET} step Exit-Chroot-Cmd starting"
+    _run_template_cmd "$_EXIT_CONTENT" && \
+        echo "${GREEN}[INFO]${RESET} step Exit-Chroot-Cmd succeeded" || \
+        echo "${YELLOW}[WARN]${RESET} step Exit-Chroot-Cmd exited non-zero"
+    _exit_done=1
 fi
 
 # ── Package output ────────────────────────────────────────────────────────────

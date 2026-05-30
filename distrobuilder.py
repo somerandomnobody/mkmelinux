@@ -140,6 +140,18 @@ def discover_templates(build_type: str) -> list:
             results.append(info)
     return results
 
+
+def all_templates(build_type: str) -> list:
+    """Return all template info dicts, each with a 'supported' bool for build_type."""
+    if not TEMPLATES_DIR.is_dir():
+        return []
+    results = []
+    for dt_file in sorted(TEMPLATES_DIR.glob("*.dt")):
+        info = _parse_dt_info(dt_file)
+        info["supported"] = not info["supporting"] or build_type in info["supporting"]
+        results.append(info)
+    return results
+
 XFCE4_STEPS = """\
 # install and setup xfce4 desktop
 apt install lightdm xfce4 -y
@@ -324,6 +336,118 @@ DESKTOP_V86_STEPS = {
     "openbox": OPENBOX_V86_STEPS,
 }
 
+# ── Arch Linux desktop steps ──────────────────────────────────────────────────
+# Arch uses pacman, has no passwd --stdin, locale setup differs, and GNOME's
+# config lives at /etc/gdm/custom.conf (not /etc/gdm3/daemon.conf).
+
+XFCE4_ARCH_STEPS = """\
+# install and setup xfce4 desktop (Arch Linux)
+pacman -Sy --noconfirm lightdm xfce4
+systemctl enable lightdm
+echo "root:root" | chpasswd
+cp /wallpapers/* /usr/share/backgrounds/xfce/
+rm -rf /wallpapers/
+# set default wallpaper — write to root's user config (higher priority than /etc/xdg/)
+# cover all common connector names since the name varies by VM/hardware
+WALLPAPER="/usr/share/backgrounds/xfce/mkmelinux.png"
+mkdir -p /root/.config/xfce4/xfconf/xfce-perchannel-xml
+{
+  echo '<?xml version="1.0" encoding="UTF-8"?>'
+  echo '<channel name="xfce4-desktop" version="1.0">'
+  echo '  <property name="backdrop" type="empty">'
+  echo '    <property name="screen0" type="empty">'
+  for mon in monitor0 monitorVirtual-1 monitorVGA-1 monitorHDMI-1 monitorHDMI-A-1 monitorDP-1 monitoreDP-1; do
+    echo "      <property name=\\"$mon\\" type=\\"empty\\">"
+    echo '        <property name="workspace0" type="empty">'
+    echo "          <property name=\\"last-image\\" type=\\"string\\" value=\\"$WALLPAPER\\"/>"
+    echo '          <property name="image-style" type="int" value="5"/>'
+    echo '          <property name="color-style" type="int" value="0"/>'
+    echo '        </property>'
+    echo '      </property>'
+  done
+  echo '    </property>'
+  echo '  </property>'
+  echo '</channel>'
+} > /root/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
+# locale
+sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+# set auto login for root
+cat > /etc/lightdm/lightdm.conf << EOF
+[Seat:*]
+autologin-user=root
+autologin-user-timeout=0
+autologin-session=xfce
+EOF
+# remove PAM root restriction if present
+sed -i '/pam_succeed_if.so user != root/d' /etc/pam.d/lightdm-autologin
+"""
+
+KDE_ARCH_STEPS = """\
+# install and setup KDE Plasma desktop (Arch Linux)
+pacman -Sy --noconfirm sddm plasma-meta
+systemctl enable sddm
+echo "root:root" | chpasswd
+# locale
+sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+# set SDDM auto login for root
+mkdir -p /etc/sddm.conf.d
+cat > /etc/sddm.conf.d/autologin.conf << EOF
+[Autologin]
+User=root
+Session=plasma
+EOF
+sed -i '/pam_succeed_if.so user != root/d' /etc/pam.d/sddm-autologin
+"""
+
+GNOME_ARCH_STEPS = """\
+# install and setup GNOME desktop (Arch Linux)
+pacman -Sy --noconfirm gdm gnome
+systemctl enable gdm
+echo "root:root" | chpasswd
+# locale
+sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+# set GDM auto login for root
+mkdir -p /etc/gdm
+cat > /etc/gdm/custom.conf << EOF
+[daemon]
+AutomaticLoginEnable=true
+AutomaticLogin=root
+EOF
+sed -i '/pam_succeed_if.so user != root/d' /etc/pam.d/gdm-autologin
+"""
+
+OPENBOX_ARCH_STEPS = """\
+# install and setup Openbox window manager (Arch Linux)
+pacman -Sy --noconfirm lightdm openbox
+systemctl enable lightdm
+echo "root:root" | chpasswd
+# locale
+sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+# set LightDM auto login for root
+cat > /etc/lightdm/lightdm.conf << EOF
+[Seat:*]
+autologin-user=root
+autologin-user-timeout=0
+autologin-session=openbox
+EOF
+sed -i '/pam_succeed_if.so user != root/d' /etc/pam.d/lightdm-autologin
+"""
+
+DESKTOP_ARCH_STEPS = {
+    "xfce4":   XFCE4_ARCH_STEPS,
+    "kde":     KDE_ARCH_STEPS,
+    "gnome":   GNOME_ARCH_STEPS,
+    "openbox": OPENBOX_ARCH_STEPS,
+}
+
 # Minimal Openbox rc.xml — no keyboard shortcuts, no mouse desktop bindings.
 _LOCKDOWN_RC_XML = """\
 <?xml version="1.0" encoding="UTF-8"?>
@@ -431,6 +555,47 @@ chmod +x /root/.xinitrc
 """
 
 
+def build_single_app_arch_steps(command: str, lockdown: bool) -> str:
+    """Kiosk mode for Arch Linux: lightdm + openbox, pacman packages."""
+    lockdown_block = ""
+    if lockdown:
+        lockdown_block = """\
+# lockdown: replace Openbox config with one that has no keyboard shortcuts
+mkdir -p /etc/xdg/openbox
+cat > /etc/xdg/openbox/rc.xml << 'OBEOF'
+""" + _LOCKDOWN_RC_XML + "OBEOF\n"
+
+    return f"""\
+# Single App Runner - Openbox kiosk mode (Arch Linux)
+pacman -Sy --noconfirm lightdm openbox
+systemctl enable lightdm
+echo "root:root" | chpasswd
+# locale
+sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+# remove right-click desktop menu
+mkdir -p /etc/xdg/openbox
+cat > /etc/xdg/openbox/menu.xml << 'OBEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+</openbox_menu>
+OBEOF
+# autostart the app
+cat > /etc/xdg/openbox/autostart << 'OBEOF'
+{command} &
+OBEOF
+{lockdown_block}# LightDM auto login for root
+cat > /etc/lightdm/lightdm.conf << 'OBEOF'
+[Seat:*]
+autologin-user=root
+autologin-user-timeout=0
+autologin-session=openbox
+OBEOF
+sed -i '/pam_succeed_if.so user != root/d' /etc/pam.d/lightdm-autologin
+"""
+
+
 class BuildConfig:
     """Holds the user's choices across wizard screens."""
     def __init__(self) -> None:
@@ -458,6 +623,7 @@ class BuildConfig:
             {"image": "", "title": "", "body": ""},
             {"image": "", "title": "", "body": ""},
         ]
+        self.droidos_type = "MOBILE"  # MOBILE or ANDROIDTV
 
 
 config = BuildConfig()
@@ -480,7 +646,7 @@ class WizardPage(Widget):
         overflow: hidden;
     }
     WizardPage .box {
-        width: 66;
+        width: 76;
         border: round $primary;
         padding: 1 2;
     }
@@ -636,7 +802,7 @@ class MainScreen(Screen):
 
 class BuildTypeScreen(WizardPage):
     CSS = """
-    .box { width: 60; }
+    .box { width: 70; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .subtitle { text-align: center; color: $text-muted; margin-bottom: 1; }
     RadioSet { margin-bottom: 1; }
@@ -665,12 +831,7 @@ class BuildTypeScreen(WizardPage):
             rs: RadioSet = self.query_one("#build_type")
             if rs.pressed_button:
                 config.build_type = rs.pressed_button.id
-            # Skip OS template screen if no templates support this build type.
-            if discover_templates(config.build_type):
-                self.go_next(OStemplateScreen())
-            else:
-                config.ostemplate = ""
-                self.go_next(CommonConfigScreen())
+            self.go_next(OStemplateScreen())
 
 
 # ---------------------------------------------------------------------------
@@ -679,14 +840,18 @@ class BuildTypeScreen(WizardPage):
 
 class OStemplateScreen(WizardPage):
     CSS = """
-    .box { width: 66; }
+    .box { width: 76; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .subtitle { color: $text-muted; margin-bottom: 1; }
     RadioSet { margin-bottom: 1; }
     """
 
     def compose(self) -> ComposeResult:
-        templates = discover_templates(config.build_type)
+        templates = all_templates(config.build_type)
+        # If the previously chosen template doesn't support this build type, fall back to Debian.
+        debian_selected = config.ostemplate == "" or not any(
+            t["stem"] == config.ostemplate and t["supported"] for t in templates
+        )
         with Vertical(classes="content"):
             with Vertical(classes="box"):
                 yield Label("What OS do you want to build?", classes="title")
@@ -698,15 +863,17 @@ class OStemplateScreen(WizardPage):
                 with RadioSet(id="ostemplate"):
                     yield RadioButton(
                         "Debian  (default — most features supported)",
-                        value=config.ostemplate == "",
+                        value=debian_selected,
                         id="__debian__",
                     )
                     for tmpl in templates:
                         desc = f"  — {tmpl['description']}" if tmpl["description"] else ""
+                        suffix = "" if tmpl["supported"] else "  (not available for this build type)"
                         yield RadioButton(
-                            f"{tmpl['display_name']}{desc}",
-                            value=config.ostemplate == tmpl["stem"],
+                            f"{tmpl['display_name']}{desc}{suffix}",
+                            value=tmpl["supported"] and config.ostemplate == tmpl["stem"],
                             id=tmpl["stem"],
+                            disabled=not tmpl["supported"],
                         )
         with Horizontal(classes="btn-bar"):
             yield Button("← Back", id="back")
@@ -730,7 +897,7 @@ class OStemplateScreen(WizardPage):
 
 class CommonConfigScreen(WizardPage):
     CSS = """
-    .box { width: 60; }
+    .box { width: 70; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     Label { margin-top: 1; }
     Input { margin-bottom: 1; }
@@ -777,6 +944,8 @@ class CommonConfigScreen(WizardPage):
                     config.ostype = rs.pressed_button.id
             if config.build_type == "HARDDISK":
                 self.go_next(VMConfigScreen())
+            elif config.ostemplate == "droidos":
+                self.go_next(DroidOSConfigScreen())
             else:
                 self.go_next(DesktopScreen())
 
@@ -787,7 +956,7 @@ class CommonConfigScreen(WizardPage):
 
 class VMConfigScreen(WizardPage):
     CSS = """
-    .box { width: 60; }
+    .box { width: 70; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     Label { margin-top: 1; }
     Input { margin-bottom: 1; }
@@ -818,7 +987,10 @@ class VMConfigScreen(WizardPage):
                 self.query_one("#error", Static).update("Please enter a positive integer.")
                 return
             config.vhd_size = int(raw)
-            self.go_next(DesktopScreen())
+            if config.ostemplate == "droidos":
+                self.go_next(DroidOSConfigScreen())
+            else:
+                self.go_next(DesktopScreen())
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +999,7 @@ class VMConfigScreen(WizardPage):
 
 class DesktopScreen(WizardPage):
     CSS = """
-    .box { width: 60; }
+    .box { width: 70; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .subtitle { color: $text-muted; margin-bottom: 1; }
     RadioSet { margin-bottom: 1; }
@@ -878,7 +1050,7 @@ class DesktopScreen(WizardPage):
 
 class SingleAppConfigScreen(WizardPage):
     CSS = """
-    .box { width: 64; }
+    .box { width: 74; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     Label { margin-top: 1; }
     Input { margin-bottom: 1; }
@@ -938,7 +1110,7 @@ class SingleAppConfigScreen(WizardPage):
 
 class ExtraPackagesScreen(WizardPage):
     CSS = """
-    .box { width: 66; }
+    .box { width: 76; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .hint { color: $text-muted; margin-bottom: 1; }
     TextArea { height: 8; margin-bottom: 1; }
@@ -975,7 +1147,7 @@ class ExtraPackagesScreen(WizardPage):
 
 class DistroCustomizationScreen(WizardPage):
     CSS = """
-    .box { width: 66; }
+    .box { width: 76; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .section { text-style: bold; margin-top: 1; }
     .hint { color: $text-muted; }
@@ -1040,7 +1212,8 @@ class DistroCustomizationScreen(WizardPage):
 
             if config.build_type == "HARDDISK":
                 self.go_next(PostBuildScreen())
-            elif config.build_type == "ISO":
+            elif config.build_type == "ISO" and not config.ostemplate:
+                # Calamares uses an apt backend — only offer it for Debian builds.
                 self.go_next(CalamaresScreen())
             else:
                 self.go_next(ExtracustomizationScreen())
@@ -1052,7 +1225,7 @@ class DistroCustomizationScreen(WizardPage):
 
 class CalamaresScreen(WizardPage):
     CSS = """
-    .box { width: 70; }
+    .box { width: 80; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .hint { color: $text-muted; margin-bottom: 1; }
     .slides { margin-top: 1; }
@@ -1118,7 +1291,7 @@ class CalamaresScreen(WizardPage):
 
 class PostBuildScreen(WizardPage):
     CSS = """
-    .box { width: 66; }
+    .box { width: 76; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .hint { color: $text-muted; margin-bottom: 1; }
     Checkbox { margin-bottom: 1; }
@@ -1167,6 +1340,13 @@ BROWSER_PACKAGES = {
     "falkon":   "falkon",
 }
 
+# Arch ships plain firefox (no ESR package); everything else is the same name.
+BROWSER_PACKAGES_ARCH = {
+    "firefox":  "firefox",
+    "chromium": "chromium",
+    "falkon":   "falkon",
+}
+
 BROWSER_LABELS = {
     "firefox":  "Firefox ESR",
     "chromium": "Chromium",
@@ -1174,22 +1354,33 @@ BROWSER_LABELS = {
 }
 
 
-def build_browser_steps(browser: str) -> str:
-    pkg = BROWSER_PACKAGES.get(browser, "")
+def build_browser_steps(browser: str, is_arch: bool = False) -> str:
+    pkg = (BROWSER_PACKAGES_ARCH if is_arch else BROWSER_PACKAGES).get(browser, "")
     if not pkg:
         return ""
+    if is_arch:
+        return f"# install browser\npacman -Sy --noconfirm {pkg}\n"
     return f"# install browser\napt install {pkg} -y\n"
 
 
-def build_user_steps(username: str, password: str, desktop: str) -> str:
+def build_user_steps(username: str, password: str, desktop: str, is_arch: bool = False) -> str:
     if not username:
         return ""
     steps = f"""\
 # create main user
 useradd -m -s /bin/bash {username}
 echo "{username}:{password}" | chpasswd
-usermod -aG sudo {username}
 """
+    if is_arch:
+        # wheel is the sudoers group on Arch; sudo must be installed explicitly.
+        steps += f"""\
+pacman -Sy --noconfirm sudo
+sed -i 's/# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+usermod -aG wheel {username}
+"""
+    else:
+        steps += f"usermod -aG sudo {username}\n"
+
     if config.build_type == "V86":
         # v86 uses xinit + getty autologin — no display manager config to update
         if desktop in ("xfce4", "openbox", "single_app"):
@@ -1210,14 +1401,18 @@ PROF
         elif desktop == "kde":
             steps += f"sed -i 's/User=root/User={username}/' /etc/sddm.conf.d/autologin.conf\n"
         elif desktop == "gnome":
-            steps += f"sed -i 's/AutomaticLogin=root/AutomaticLogin={username}/' /etc/gdm3/daemon.conf\n"
+            # Arch uses /etc/gdm/custom.conf; Debian uses /etc/gdm3/daemon.conf
+            gdm_conf = "/etc/gdm/custom.conf" if is_arch else "/etc/gdm3/daemon.conf"
+            steps += f"sed -i 's/AutomaticLogin=root/AutomaticLogin={username}/' {gdm_conf}\n"
     return steps
 
 
-def build_extra_packages_steps(packages: str) -> str:
+def build_extra_packages_steps(packages: str, is_arch: bool = False) -> str:
     pkgs = " ".join(packages.split())  # normalise whitespace / newlines
     if not pkgs:
         return ""
+    if is_arch:
+        return f"# extra packages\npacman -Sy --noconfirm {pkgs}\n"
     return f"# extra packages\napt install {pkgs} -y\n"
 
 
@@ -1255,20 +1450,31 @@ PROF
 def assemble_chroot_script() -> str:
     """Build the full extrachrootsteps.sh content from the current config."""
     script = ""
-    is_v86 = config.build_type == "V86"
+    is_v86  = config.build_type == "V86"
+    is_arch = config.ostemplate == "arch-linux"
+
     if config.desktop == "single_app":
-        script += build_single_app_v86_steps(config.single_app_command, config.single_app_lockdown) if is_v86 else build_single_app_steps(config.single_app_command, config.single_app_lockdown)
+        if is_v86:
+            script += build_single_app_v86_steps(config.single_app_command, config.single_app_lockdown)
+        elif is_arch:
+            script += build_single_app_arch_steps(config.single_app_command, config.single_app_lockdown)
+        else:
+            script += build_single_app_steps(config.single_app_command, config.single_app_lockdown)
     elif config.desktop in DESKTOP_STEPS:
         if is_v86 and config.desktop in DESKTOP_V86_STEPS:
             script += DESKTOP_V86_STEPS[config.desktop]
+        elif is_arch and config.desktop in DESKTOP_ARCH_STEPS:
+            script += DESKTOP_ARCH_STEPS[config.desktop]
         else:
             script += DESKTOP_STEPS[config.desktop]
-    script += build_extra_packages_steps(config.extra_packages)
-    script += build_browser_steps(config.browser)
-    script += build_user_steps(config.username, config.user_password, config.desktop)
+
+    script += build_extra_packages_steps(config.extra_packages, is_arch=is_arch)
+    script += build_browser_steps(config.browser, is_arch=is_arch)
+    script += build_user_steps(config.username, config.user_password, config.desktop, is_arch=is_arch)
     if is_v86 and config.v86_custom_marker and config.desktop != "none":
         script += build_v86_marker_steps(config.desktop, config.v86_marker_delay)
-    if config.install_calamares:
+    # Calamares uses an apt backend and Debian-specific paths — skip for Arch.
+    if config.install_calamares and not is_arch:
         script += build_calamares_steps(config.calamares_slides, config.desktop)
     return script
 
@@ -1550,7 +1756,7 @@ def build_calamares_steps(slides: list, desktop: str) -> str:
 
 class V86OptionsScreen(WizardPage):
     CSS = """
-    .box { width: 66; }
+    .box { width: 76; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .hint { color: $text-muted; margin-bottom: 1; }
     .section { text-style: bold; margin-top: 1; }
@@ -1634,7 +1840,7 @@ def _dir_tree_text(path: Path) -> str:
 
 class ExtracustomizationScreen(WizardPage):
     CSS = """
-    .box { width: 64; }
+    .box { width: 74; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .hint { color: $text-muted; margin-bottom: 1; }
     """
@@ -1672,12 +1878,64 @@ class ExtracustomizationScreen(WizardPage):
 
 
 # ---------------------------------------------------------------------------
+# Screen — DroidOS configuration (only shown when droidos template is selected)
+# ---------------------------------------------------------------------------
+
+class DroidOSConfigScreen(WizardPage):
+    CSS = """
+    .box { width: 76; }
+    .title { text-align: center; text-style: bold; margin-bottom: 1; }
+    .hint { color: $text-muted; margin-bottom: 1; }
+    .section-label { text-style: bold; margin-top: 1; margin-bottom: 0; }
+    """
+
+    def compose(self) -> ComposeResult:
+        apk_path = str(DISTRO_DIR / "extracustomization" / "var" / "lib" / "droidos" / "apks")
+        with Vertical(classes="content"):
+            with Vertical(classes="box"):
+                yield Label("DroidOS configuration", classes="title")
+                yield Label("Android variant", classes="section-label")
+                with RadioSet(id="droidos_type"):
+                    yield RadioButton(
+                        "Mobile  — standard Android (default)",
+                        id="MOBILE",
+                        value=config.droidos_type == "MOBILE",
+                    )
+                    yield RadioButton(
+                        "Android TV  — LineageOS 20 TV build with GApps (requires hardware GPU)",
+                        id="ANDROIDTV",
+                        value=config.droidos_type == "ANDROIDTV",
+                    )
+                yield Label("Pre-installing APKs", classes="section-label")
+                yield Static(
+                    f"Drop .apk files into:\n  {apk_path}\n"
+                    "They will be injected into the Android system image at build time.",
+                    classes="hint",
+                )
+        with Horizontal(classes="btn-bar"):
+            yield Button("← Back", id="back")
+            yield Button("Next →", variant="primary", id="next")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "back":
+            self.go_back()
+            return
+        if event.button.id == "next":
+            rs: RadioSet = self.query_one("#droidos_type")
+            if rs.pressed_button:
+                config.droidos_type = rs.pressed_button.id
+            apk_dir = DISTRO_DIR / "extracustomization" / "var" / "lib" / "droidos" / "apks"
+            apk_dir.mkdir(parents=True, exist_ok=True)
+            self.go_next(ExtracustomizationScreen())
+
+
+# ---------------------------------------------------------------------------
 # Screen 6a — extrachrootsteps.sh editor
 # ---------------------------------------------------------------------------
 
 class ScriptEditorScreen(WizardPage):
     CSS = """
-    .box { width: 80; }
+    .box { width: 90; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .hint { color: $text-muted; margin-bottom: 1; }
     TextArea { height: 14; margin-bottom: 1; }
@@ -1720,7 +1978,7 @@ class ScriptEditorScreen(WizardPage):
 
 class ReviewScreen(WizardPage):
     CSS = """
-    .box { width: 60; }
+    .box { width: 70; }
     .title { text-align: center; text-style: bold; margin-bottom: 1; }
     .summary { margin-bottom: 1; }
     """
@@ -1736,6 +1994,8 @@ class ReviewScreen(WizardPage):
             f"  Hostname   : {config.hostname}",
             os_line,
         ]
+        if config.ostemplate == "droidos":
+            lines.append(f"  DroidOS    : {config.droidos_type}")
         if config.build_type == "HARDDISK":
             lines.append(f"  Drive size : {config.vhd_size} GB")
         lines.append(f"  Desktop    : {config.desktop}")
@@ -1820,6 +2080,8 @@ class ReviewScreen(WizardPage):
             args_parts.append("GENERATE_NEW_ROOTFS=YES")
         if config.build_type == "V86" and config.v86_custom_marker:
             args_parts.append("SKIP_BOOT_MARKER=YES")
+        if config.ostemplate == "droidos":
+            args_parts.append(f"DT.DROIDOS_TYPE={config.droidos_type}")
         ARGUMENTS_FILE.write_text(" ".join(args_parts) + "\n")
 
         chroot_script = config.custom_script_content if config.custom_script_content else assemble_chroot_script()

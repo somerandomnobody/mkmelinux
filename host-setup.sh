@@ -9,7 +9,7 @@ GREEN=$(tput setaf 2 2>/dev/null || true)
 YELLOW=$(tput setaf 3 2>/dev/null || true)
 RESET=$(tput sgr0 2>/dev/null || true)
 
-echo "${GREEN}=== mkmelinux host-setup ===${RESET}"
+echo "${GREEN}=== mkmelinux TUI ===${RESET}"
 
 # Check KVM
 if [ -c /dev/kvm ]; then

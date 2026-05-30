@@ -1,0 +1,1163 @@
+[DistroInfo]
+DistroName = "DroidOS"
+Arch = "x64"
+Description = "Android-x86 like OS for mkmelinux."
+Supporting = ["ISO", "HARDDISK"]
+
+[ContainerConfig]
+Packages = ["curl", "zstd"]
+
+[DistroConfig]
+Download-Rootfs-Cmd = '''
+lastarchver=$(curl https://archive.archlinux.org/iso/ | grep -oE '[0-9]{4}\.[0-9]{2}\.[0-9]{2}' | tail -n 1)
+curl -O https://archive.archlinux.org/iso/${lastarchver}/archlinux-bootstrap-x86_64.tar.zst
+unzstd archlinux-bootstrap-x86_64.tar.zst
+mkdir tmp-extract
+tar -xvf ./archlinux-bootstrap-x86_64.tar -C ./tmp-extract
+mv ./tmp-extract/root.x86_64 ./rootfs
+rm -rf ./tmp-extract
+'''
+
+# pacman requires the rootfs to be a mountpoint, /proc for process info,
+# /dev for GnuPG entropy (pacman-key --init reads /dev/urandom), and
+# resolv.conf so DNS works inside the chroot. Mirrors ship commented out
+# in the bootstrap tarball, so we uncomment them before keying.
+# pacman-key must run inside the chroot — the build container is Debian
+# and does not have pacman-key on its own PATH.
+Setup-Chroot-Cmd = '''
+mount --bind ./rootfs ./rootfs
+mount -t proc none ./rootfs/proc
+mount --bind /sys ./rootfs/sys
+mount --bind /dev ./rootfs/dev
+mount --bind /dev/pts ./rootfs/dev/pts
+mount --bind /etc/resolv.conf ./rootfs/etc/resolv.conf
+sed -i 's/^#Server/Server/' ./rootfs/etc/pacman.d/mirrorlist
+chroot ./rootfs pacman-key --init
+chroot ./rootfs pacman-key --populate archlinux
+'''
+
+Exit-Chroot-Cmd = '''
+umount ./rootfs/etc/resolv.conf
+umount ./rootfs/dev/pts
+umount ./rootfs/dev
+umount ./rootfs/sys
+umount ./rootfs/proc
+umount ./rootfs
+'''
+
+# Packages needed to produce a bootable squashfs ISO (BIOS + UEFI via grub).
+ISO-Install-Base-Packages-Cmd = '''
+echo "Setting up DroidOS..."
+pacman -Sy --noconfirm linux-zen grub squashfs-tools efibootmgr gptfdisk rsync dhcpcd busybox \
+    weston xorg-xwayland networkmanager linux-firmware libdisplay-info lxc dnsmasq nftables \
+    pipewire pipewire-pulse wireplumber git python-requests python-lxml \
+    mesa vulkan-intel intel-media-driver libva-mesa-driver dialog
+
+# archlinuxcn repo provides pre-built waydroid (avoids AUR/makepkg in chroot)
+printf '\n[archlinuxcn]\nServer = https://repo.archlinuxcn.org/$arch\n' >> /etc/pacman.conf
+pacman -Sy --noconfirm archlinuxcn-keyring
+pacman -S --noconfirm waydroid
+
+systemctl enable NetworkManager
+
+# binder kernel module
+echo "options binder_linux devices=binder,hwbinder,vndbinder" > /etc/modprobe.d/waydroid.conf
+printf 'binder_linux\nbridge\ntun\nvirtio_gpu\nbochs_drm\nqxl\nvirtio_input\n' > /etc/modules-load.d/waydroid.conf
+
+cat > /etc/udev/rules.d/99-waydroid-binder.rules << 'UDEV_EOF'
+KERNEL=="binder",         MODE="0666"
+KERNEL=="hwbinder",       MODE="0666"
+KERNEL=="vndbinder",      MODE="0666"
+KERNEL=="anbox-binder",   MODE="0666"
+KERNEL=="anbox-hwbinder", MODE="0666"
+KERNEL=="anbox-vndbinder",MODE="0666"
+UDEV_EOF
+
+# LXC monitor rootfs dirs — Waydroid's LXC mounts tmpfs/procfs/sysfs over these
+# at container start; the lxc package ships /usr/lib/lxc/rootfs/ empty, so create
+# the subdirs and keep them present across tmpfs upper layers.
+mkdir -p /usr/lib/lxc/rootfs/dev /usr/lib/lxc/rootfs/proc /usr/lib/lxc/rootfs/sys
+cat > /etc/tmpfiles.d/waydroid-lxc.conf << 'TMPFILES_EOF'
+d /usr/lib/lxc/rootfs       0755 root root -
+d /usr/lib/lxc/rootfs/dev   0755 root root -
+d /usr/lib/lxc/rootfs/proc  0755 root root -
+d /usr/lib/lxc/rootfs/sys   0755 root root -
+TMPFILES_EOF
+
+# Keep NetworkManager off the Waydroid bridge / veth pairs
+mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/waydroid.conf << 'NM_EOF'
+[keyfile]
+unmanaged-devices=interface-name:waydroid0;interface-name:veth*
+NM_EOF
+
+echo "Setting up root autologin..."
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << 'GETTY_EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+GETTY_EOF
+
+echo "Writing Configs..."
+cat > /usr/local/bin/droidos-binder << 'BINDER_EOF'
+#!/bin/bash
+lsmod | grep -q '^binder_linux' || modprobe binder_linux 2>/dev/null || true
+until mountpoint -q /dev/binderfs; do
+    mkdir -p /dev/binderfs
+    mount -t binder binder /dev/binderfs 2>/dev/null || true
+    sleep 1
+done
+
+python3 - <<'PY_EOF'
+import fcntl, os, ctypes
+class D(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char*256), ("major", ctypes.c_uint32), ("minor", ctypes.c_uint32)]
+BINDER_CTL_ADD = 0xC1086201
+fd = os.open("/dev/binderfs/binder-control", os.O_RDWR)
+for name in (b"binder", b"hwbinder", b"vndbinder"):
+    d = D(); d.name = name
+    try:
+        fcntl.ioctl(fd, BINDER_CTL_ADD, d)
+    except OSError:
+        pass
+os.close(fd)
+PY_EOF
+
+for dev in binder hwbinder vndbinder; do
+    if   [ -c /dev/binderfs/$dev ];       then ln -sf /dev/binderfs/$dev       /dev/$dev
+    elif [ -c /dev/binderfs/anbox-$dev ]; then ln -sf /dev/binderfs/anbox-$dev /dev/$dev
+    fi
+done
+echo "binder symlinks ready"
+BINDER_EOF
+chmod +x /usr/local/bin/droidos-binder
+
+cat > /root/runwaydroid.sh << 'EOF'
+#!/bin/bash
+[ -f /etc/droidos/config ] && source /etc/droidos/config
+
+IS_LIVE=0
+[ -d /run/mklive/rootfs ] && IS_LIVE=1
+
+# Wait up to 10s for NetworkManager to auto-connect.
+CONNECTED=0
+for i in $(seq 1 10); do
+    ip route show default | grep -q . && CONNECTED=1 && break
+    sleep 1
+done
+
+if [ $IS_LIVE -eq 1 ]; then
+    # Live ISO: handle internet first, then show the boot menu.
+    if [ $CONNECTED -eq 0 ]; then
+        dialog --title "DroidOS" \
+            --msgbox "\nWelcome to DroidOS\n\nPress OK to set up your internet connection." 9 45
+        clear
+        nmtui connect
+        for i in $(seq 1 5); do
+            ip route show default | grep -q . && CONNECTED=1 && break
+            sleep 1
+        done
+    fi
+    clear
+
+    while true; do
+        BOOT_CHOICE=$(dialog --clear --title "DroidOS" \
+            --menu "\nWelcome to DroidOS. What would you like to do?" 15 52 5 \
+            1 "Run DroidOS Live" \
+            2 "Install DroidOS to Disk" \
+            3 "Shut Down" \
+            4 "Restart" \
+            5 "Exit to Shell" \
+            3>&1 1>&2 2>&3)
+        clear
+        case "$BOOT_CHOICE" in
+            2) droidos-install ;;
+            3) poweroff ;;
+            4) reboot ;;
+            5) exec /bin/bash ;;
+            *) break ;;
+        esac
+    done
+else
+    # Installed system: only prompt for network if not connected.
+    if [ $CONNECTED -eq 0 ]; then
+        dialog --title "DroidOS" \
+            --msgbox "\nPress OK to set up your internet connection." 7 45
+        clear
+        nmtui connect
+    fi
+fi
+
+droidos-audio &
+until [ -S /run/user/0/pulse/native ]; do sleep 1; done
+pactl set-sink-volume @DEFAULT_SINK@ 100%
+
+# GPU detection (one-time — sets waydroid.cfg and waydroid_base.prop).
+PROP_FILE=/var/lib/waydroid/waydroid_base.prop
+CFG_FILE=/var/lib/waydroid/waydroid.cfg
+SW_RENDER=0
+NVIDIA=0
+
+for v in /sys/class/drm/card*/device/vendor; do
+    [ -f "$v" ] && grep -q '0x10de' "$v" && NVIDIA=1 && break
+done
+
+find_intel_render() {
+    for card in /sys/class/drm/card[0-9]*/; do
+        vendor=$(cat "${card}device/vendor" 2>/dev/null) || continue
+        [ "$vendor" = "0x8086" ] || continue
+        cardnum="${card%/}"; cardnum="${cardnum##*card}"
+        renderdev="/dev/dri/renderD$((128 + cardnum))"
+        [ -c "$renderdev" ] && echo "$renderdev" && return 0
+    done
+    return 1
+}
+
+if ! ls /dev/dri/renderD* &>/dev/null 2>&1; then
+    echo "droidos: no GPU render node — enabling SwiftShader"
+    SW_RENDER=1
+elif [ $NVIDIA -eq 1 ]; then
+    INTEL_RENDER=$(find_intel_render)
+    if [ -n "$INTEL_RENDER" ]; then
+        echo "droidos: Nvidia GPU detected, routing Waydroid through Intel iGPU ($INTEL_RENDER)"
+        if grep -q '^\[waydroid\]' "$CFG_FILE" 2>/dev/null; then
+            if grep -q '^drm_device' "$CFG_FILE"; then
+                sed -i "s|^drm_device.*|drm_device = $INTEL_RENDER|" "$CFG_FILE"
+            else
+                sed -i "/^\[waydroid\]/a drm_device = $INTEL_RENDER" "$CFG_FILE"
+            fi
+        fi
+    else
+        echo "droidos: Nvidia GPU, no Intel iGPU found — enabling SwiftShader"
+        SW_RENDER=1
+    fi
+fi
+
+if [ $SW_RENDER -eq 1 ] && [ -f "$PROP_FILE" ]; then
+    if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
+        echo ""
+        echo "ERROR: Android TV requires hardware GPU rendering."
+        echo "This computer does not have a supported GPU (Intel or AMD required)."
+        echo "Nvidia GPUs are not supported unless an Intel iGPU is also present."
+        echo ""
+        echo "Use the standard DroidOS image on this hardware instead."
+        while true; do sleep 60; done
+    fi
+    sed -i '/^ro\.hardware\.gralloc=/d;/^ro\.hardware\.egl=/d' "$PROP_FILE"
+    printf 'ro.hardware.gralloc=default\nro.hardware.egl=swiftshader\n' >> "$PROP_FILE"
+fi
+
+# APK installer runs once in the background on first boot.
+droidos-install-apks &
+
+FAILS=0
+while true; do
+    # Re-init binder and container on every session start (required after Android shuts down).
+    droidos-binder
+    systemctl restart waydroid-container
+
+    T=$(date +%s)
+
+    # Run show-full-ui in the background. The watcher kills it when Android
+    # shuts down — detected by sys.boot_completed going silent after boot,
+    # or by the container service stopping. SIGKILL follows SIGTERM because
+    # show-full-ui can get stuck in a binder syscall and ignore SIGTERM.
+    waydroid show-full-ui &
+    SHOW_PID=$!
+    (
+        # Phase 1: wait for Android to finish booting (up to 3 min).
+        booted=0
+        for _i in $(seq 1 90); do
+            kill -0 $SHOW_PID 2>/dev/null || break
+            timeout 3 waydroid prop get sys.boot_completed 2>/dev/null | grep -q '^1$' \
+                && booted=1 && break
+            sleep 2
+        done
+
+        # Phase 2: watch for Android shutdown.
+        # The container-service check catches clean stops; the prop check
+        # catches in-session shutdowns where the service may auto-restart.
+        prop_fails=0
+        while kill -0 $SHOW_PID 2>/dev/null; do
+            sleep 4
+            systemctl is-active --quiet waydroid-container 2>/dev/null || break
+            if [ $booted -eq 1 ]; then
+                if timeout 3 waydroid prop get sys.boot_completed 2>/dev/null | grep -q '^1$'; then
+                    prop_fails=0
+                else
+                    (( prop_fails++ ))
+                    [ $prop_fails -ge 3 ] && break
+                fi
+            fi
+        done
+
+        sleep 2
+        kill $SHOW_PID 2>/dev/null
+        sleep 4
+        kill -0 $SHOW_PID 2>/dev/null && kill -9 $SHOW_PID 2>/dev/null
+    ) &
+    WATCHER_PID=$!
+    wait $SHOW_PID 2>/dev/null
+    kill $WATCHER_PID 2>/dev/null
+
+    RUNTIME=$(( $(date +%s) - T ))
+
+    if (( RUNTIME < 10 )); then
+        (( FAILS++ ))
+        if (( FAILS >= 3 )); then
+            echo "droidos: show-full-ui crashed 3 times in a row, rebooting"
+            reboot
+        fi
+        sleep 2
+        continue
+    fi
+
+    FAILS=0
+
+    if [ -d /run/mklive/rootfs ]; then
+        CHOICE=$(dialog --clear --title "DroidOS" \
+            --menu "\nWaydroid has exited. What would you like to do?" 15 52 5 \
+            1 "Continue to Waydroid" \
+            2 "Shut Down" \
+            3 "Restart" \
+            4 "Enter Shell" \
+            5 "Install to Disk" \
+            3>&1 1>&2 2>&3)
+    else
+        CHOICE=$(dialog --clear --title "DroidOS" \
+            --menu "\nWaydroid has exited. What would you like to do?" 13 52 4 \
+            1 "Continue to Waydroid" \
+            2 "Shut Down" \
+            3 "Restart" \
+            4 "Enter Shell" \
+            3>&1 1>&2 2>&3)
+    fi
+    clear
+
+    case "$CHOICE" in
+        2) poweroff ;;
+        3) reboot ;;
+        4) exec /bin/bash ;;
+        5) droidos-install ;;
+        *) ;;
+    esac
+done
+EOF
+chmod +x /root/runwaydroid.sh
+
+echo "Setting up Weston..."
+mkdir -p /root/.config
+cat > /root/.config/weston.ini << 'WESTON_EOF'
+[core]
+backend=drm
+idle-time=0
+shell=kiosk-shell.so
+
+[output]
+name=*
+mode=current
+WESTON_EOF
+
+cat > /usr/local/bin/droidos-weston << 'WESTON_SCRIPT_EOF'
+#!/bin/bash
+# pixman (CPU) renderer: avoids the DMA-BUF fence race that causes Z-line
+# tearing during animations when Waydroid hands frames to Weston on Intel.
+ARGS=(--config=/root/.config/weston.ini --renderer=pixman -- weston-terminal --shell=/root/runwaydroid.sh)
+
+run() { weston "${ARGS[@]}"; }
+
+T=$(date +%s)
+run
+if (( $? != 0 && $(date +%s) - T < 5 )); then
+    echo "droidos-weston: DRM backend failed quickly — retrying in 5 seconds"
+    sleep 5
+    exec run
+fi
+WESTON_SCRIPT_EOF
+chmod +x /usr/local/bin/droidos-weston
+
+cat > /root/.bash_profile << 'EOF'
+if [[ $(tty) == /dev/tty1 ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+  exec droidos-weston
+fi
+EOF
+
+echo "writing script for droidos audio"
+cat > /usr/local/bin/droidos-audio << 'AUDIO_EOF'
+#!/bin/bash
+export XDG_RUNTIME_DIR=/run/user/0
+export HOME=/root
+export USER=root
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+
+/usr/bin/pipewire &
+PIPEWIRE_PID=$!
+for i in $(seq 1 40); do
+    [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
+    sleep 0.25
+done
+if [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+    echo "droidos-audio: pipewire socket never appeared" >&2
+    exit 1
+fi
+
+/usr/bin/wireplumber &
+WIREPLUMBER_PID=$!
+sleep 1
+/usr/bin/pipewire-pulse &
+PULSE_PID=$!
+
+for i in $(seq 1 60); do
+    [ -S "$XDG_RUNTIME_DIR/pulse/native" ] && break
+    sleep 0.5
+done
+if [ ! -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+    echo "droidos-audio: pulse socket never appeared" >&2
+    exit 1
+fi
+echo "droidos-audio: pipewire + pulse sockets ready"
+
+wait -n
+exit 1
+AUDIO_EOF
+chmod +x /usr/local/bin/droidos-audio
+
+# Bake build-time variables into the image so runtime scripts can read them
+mkdir -p /etc/droidos
+echo "DROIDOS_TYPE=${DROIDOS_TYPE:-MOBILE}" > /etc/droidos/config
+
+echo "[droidos-setup] Downloading Android images..."
+if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
+    echo "[droidos-setup] Android TV build selected."
+    waydroid init -c https://ota.supechicken666.dev/system \
+                  -v https://ota.supechicken666.dev/vendor -s GAPPS
+else
+    waydroid init -s VANILLA
+fi
+echo "[droidos-setup] Android images ready."
+
+# Make all apps see a WiFi connection; internet flows through the waydroid0 bridge
+sed -i '/^persist\.waydroid\.fake_wifi=/d' /var/lib/waydroid/waydroid_base.prop 2>/dev/null || true
+echo 'persist.waydroid.fake_wifi=*' >> /var/lib/waydroid/waydroid_base.prop
+
+git clone https://github.com/casualsnek/waydroid_script /opt/waydroid_script 2>/dev/null || true
+cd /opt/waydroid_script
+echo "[droidos-setup] Installing libhoudini (ARM support)..."
+python3 main.py install libhoudini && echo "[droidos-setup] libhoudini installed." \
+    || echo "[droidos-setup] WARNING: libhoudini install failed."
+echo "[droidos-setup] Installing GApps..."
+python3 main.py install gapps && echo "[droidos-setup] GApps installed." \
+    || echo "[droidos-setup] WARNING: GApps install failed."
+'''
+
+# Packages needed for a UEFI virtual-machine disk image.
+HARDDISK-Install-Base-Packages-Cmd = '''
+echo "Setting up DroidOS..."
+pacman -Sy --noconfirm linux-zen grub efibootmgr dhcpcd busybox \
+    weston xorg-xwayland networkmanager linux-firmware libdisplay-info lxc dnsmasq nftables \
+    pipewire pipewire-pulse wireplumber git python-requests python-lxml \
+    mesa vulkan-intel intel-media-driver libva-mesa-driver dialog
+
+printf '\n[archlinuxcn]\nServer = https://repo.archlinuxcn.org/$arch\n' >> /etc/pacman.conf
+pacman -Sy --noconfirm archlinuxcn-keyring
+pacman -S --noconfirm waydroid
+
+systemctl enable NetworkManager
+
+echo "options binder_linux devices=binder,hwbinder,vndbinder" > /etc/modprobe.d/waydroid.conf
+printf 'binder_linux\nbridge\ntun\nvirtio_gpu\nbochs_drm\nqxl\nvirtio_input\n' > /etc/modules-load.d/waydroid.conf
+
+cat > /etc/udev/rules.d/99-waydroid-binder.rules << 'UDEV_EOF'
+KERNEL=="binder",         MODE="0666"
+KERNEL=="hwbinder",       MODE="0666"
+KERNEL=="vndbinder",      MODE="0666"
+KERNEL=="anbox-binder",   MODE="0666"
+KERNEL=="anbox-hwbinder", MODE="0666"
+KERNEL=="anbox-vndbinder",MODE="0666"
+UDEV_EOF
+
+mkdir -p /usr/lib/lxc/rootfs/dev /usr/lib/lxc/rootfs/proc /usr/lib/lxc/rootfs/sys
+cat > /etc/tmpfiles.d/waydroid-lxc.conf << 'TMPFILES_EOF'
+d /usr/lib/lxc/rootfs       0755 root root -
+d /usr/lib/lxc/rootfs/dev   0755 root root -
+d /usr/lib/lxc/rootfs/proc  0755 root root -
+d /usr/lib/lxc/rootfs/sys   0755 root root -
+TMPFILES_EOF
+
+mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/waydroid.conf << 'NM_EOF'
+[keyfile]
+unmanaged-devices=interface-name:waydroid0;interface-name:veth*
+NM_EOF
+
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << 'GETTY_EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+GETTY_EOF
+
+cat > /usr/local/bin/droidos-binder << 'BINDER_EOF'
+#!/bin/bash
+lsmod | grep -q '^binder_linux' || modprobe binder_linux 2>/dev/null || true
+until mountpoint -q /dev/binderfs; do
+    mkdir -p /dev/binderfs
+    mount -t binder binder /dev/binderfs 2>/dev/null || true
+    sleep 1
+done
+
+python3 - <<'PY_EOF'
+import fcntl, os, ctypes
+class D(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char*256), ("major", ctypes.c_uint32), ("minor", ctypes.c_uint32)]
+BINDER_CTL_ADD = 0xC1086201
+fd = os.open("/dev/binderfs/binder-control", os.O_RDWR)
+for name in (b"binder", b"hwbinder", b"vndbinder"):
+    d = D(); d.name = name
+    try:
+        fcntl.ioctl(fd, BINDER_CTL_ADD, d)
+    except OSError:
+        pass
+os.close(fd)
+PY_EOF
+
+for dev in binder hwbinder vndbinder; do
+    if   [ -c /dev/binderfs/$dev ];       then ln -sf /dev/binderfs/$dev       /dev/$dev
+    elif [ -c /dev/binderfs/anbox-$dev ]; then ln -sf /dev/binderfs/anbox-$dev /dev/$dev
+    fi
+done
+echo "binder symlinks ready"
+BINDER_EOF
+chmod +x /usr/local/bin/droidos-binder
+
+cat > /root/runwaydroid.sh << 'EOF'
+#!/bin/bash
+[ -f /etc/droidos/config ] && source /etc/droidos/config
+
+IS_LIVE=0
+[ -d /run/mklive/rootfs ] && IS_LIVE=1
+
+# Wait up to 10s for NetworkManager to auto-connect.
+CONNECTED=0
+for i in $(seq 1 10); do
+    ip route show default | grep -q . && CONNECTED=1 && break
+    sleep 1
+done
+
+if [ $IS_LIVE -eq 1 ]; then
+    # Live ISO: handle internet first, then show the boot menu.
+    if [ $CONNECTED -eq 0 ]; then
+        dialog --title "DroidOS" \
+            --msgbox "\nWelcome to DroidOS\n\nPress OK to set up your internet connection." 9 45
+        clear
+        nmtui connect
+        for i in $(seq 1 5); do
+            ip route show default | grep -q . && CONNECTED=1 && break
+            sleep 1
+        done
+    fi
+    clear
+
+    while true; do
+        BOOT_CHOICE=$(dialog --clear --title "DroidOS" \
+            --menu "\nWelcome to DroidOS. What would you like to do?" 15 52 5 \
+            1 "Run DroidOS Live" \
+            2 "Install DroidOS to Disk" \
+            3 "Shut Down" \
+            4 "Restart" \
+            5 "Exit to Shell" \
+            3>&1 1>&2 2>&3)
+        clear
+        case "$BOOT_CHOICE" in
+            2) droidos-install ;;
+            3) poweroff ;;
+            4) reboot ;;
+            5) exec /bin/bash ;;
+            *) break ;;
+        esac
+    done
+else
+    # Installed system: only prompt for network if not connected.
+    if [ $CONNECTED -eq 0 ]; then
+        dialog --title "DroidOS" \
+            --msgbox "\nPress OK to set up your internet connection." 7 45
+        clear
+        nmtui connect
+    fi
+fi
+
+droidos-audio &
+until [ -S /run/user/0/pulse/native ]; do sleep 1; done
+pactl set-sink-volume @DEFAULT_SINK@ 100%
+
+# GPU detection (one-time — sets waydroid.cfg and waydroid_base.prop).
+PROP_FILE=/var/lib/waydroid/waydroid_base.prop
+CFG_FILE=/var/lib/waydroid/waydroid.cfg
+SW_RENDER=0
+NVIDIA=0
+
+for v in /sys/class/drm/card*/device/vendor; do
+    [ -f "$v" ] && grep -q '0x10de' "$v" && NVIDIA=1 && break
+done
+
+find_intel_render() {
+    for card in /sys/class/drm/card[0-9]*/; do
+        vendor=$(cat "${card}device/vendor" 2>/dev/null) || continue
+        [ "$vendor" = "0x8086" ] || continue
+        cardnum="${card%/}"; cardnum="${cardnum##*card}"
+        renderdev="/dev/dri/renderD$((128 + cardnum))"
+        [ -c "$renderdev" ] && echo "$renderdev" && return 0
+    done
+    return 1
+}
+
+if ! ls /dev/dri/renderD* &>/dev/null 2>&1; then
+    echo "droidos: no GPU render node — enabling SwiftShader"
+    SW_RENDER=1
+elif [ $NVIDIA -eq 1 ]; then
+    INTEL_RENDER=$(find_intel_render)
+    if [ -n "$INTEL_RENDER" ]; then
+        echo "droidos: Nvidia GPU detected, routing Waydroid through Intel iGPU ($INTEL_RENDER)"
+        if grep -q '^\[waydroid\]' "$CFG_FILE" 2>/dev/null; then
+            if grep -q '^drm_device' "$CFG_FILE"; then
+                sed -i "s|^drm_device.*|drm_device = $INTEL_RENDER|" "$CFG_FILE"
+            else
+                sed -i "/^\[waydroid\]/a drm_device = $INTEL_RENDER" "$CFG_FILE"
+            fi
+        fi
+    else
+        echo "droidos: Nvidia GPU, no Intel iGPU found — enabling SwiftShader"
+        SW_RENDER=1
+    fi
+fi
+
+if [ $SW_RENDER -eq 1 ] && [ -f "$PROP_FILE" ]; then
+    if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
+        echo ""
+        echo "ERROR: Android TV requires hardware GPU rendering."
+        echo "This computer does not have a supported GPU (Intel or AMD required)."
+        echo "Nvidia GPUs are not supported unless an Intel iGPU is also present."
+        echo ""
+        echo "Use the standard DroidOS image on this hardware instead."
+        while true; do sleep 60; done
+    fi
+    sed -i '/^ro\.hardware\.gralloc=/d;/^ro\.hardware\.egl=/d' "$PROP_FILE"
+    printf 'ro.hardware.gralloc=default\nro.hardware.egl=swiftshader\n' >> "$PROP_FILE"
+fi
+
+# APK installer runs once in the background on first boot.
+droidos-install-apks &
+
+FAILS=0
+while true; do
+    # Re-init binder and container on every session start (required after Android shuts down).
+    droidos-binder
+    systemctl restart waydroid-container
+
+    T=$(date +%s)
+
+    # Run show-full-ui in the background. The watcher kills it when Android
+    # shuts down — detected by sys.boot_completed going silent after boot,
+    # or by the container service stopping. SIGKILL follows SIGTERM because
+    # show-full-ui can get stuck in a binder syscall and ignore SIGTERM.
+    waydroid show-full-ui &
+    SHOW_PID=$!
+    (
+        # Phase 1: wait for Android to finish booting (up to 3 min).
+        booted=0
+        for _i in $(seq 1 90); do
+            kill -0 $SHOW_PID 2>/dev/null || break
+            timeout 3 waydroid prop get sys.boot_completed 2>/dev/null | grep -q '^1$' \
+                && booted=1 && break
+            sleep 2
+        done
+
+        # Phase 2: watch for Android shutdown.
+        # The container-service check catches clean stops; the prop check
+        # catches in-session shutdowns where the service may auto-restart.
+        prop_fails=0
+        while kill -0 $SHOW_PID 2>/dev/null; do
+            sleep 4
+            systemctl is-active --quiet waydroid-container 2>/dev/null || break
+            if [ $booted -eq 1 ]; then
+                if timeout 3 waydroid prop get sys.boot_completed 2>/dev/null | grep -q '^1$'; then
+                    prop_fails=0
+                else
+                    (( prop_fails++ ))
+                    [ $prop_fails -ge 3 ] && break
+                fi
+            fi
+        done
+
+        sleep 2
+        kill $SHOW_PID 2>/dev/null
+        sleep 4
+        kill -0 $SHOW_PID 2>/dev/null && kill -9 $SHOW_PID 2>/dev/null
+    ) &
+    WATCHER_PID=$!
+    wait $SHOW_PID 2>/dev/null
+    kill $WATCHER_PID 2>/dev/null
+
+    RUNTIME=$(( $(date +%s) - T ))
+
+    if (( RUNTIME < 10 )); then
+        (( FAILS++ ))
+        if (( FAILS >= 3 )); then
+            echo "droidos: show-full-ui crashed 3 times in a row, rebooting"
+            reboot
+        fi
+        sleep 2
+        continue
+    fi
+
+    FAILS=0
+
+    if [ -d /run/mklive/rootfs ]; then
+        CHOICE=$(dialog --clear --title "DroidOS" \
+            --menu "\nWaydroid has exited. What would you like to do?" 15 52 5 \
+            1 "Continue to Waydroid" \
+            2 "Shut Down" \
+            3 "Restart" \
+            4 "Enter Shell" \
+            5 "Install to Disk" \
+            3>&1 1>&2 2>&3)
+    else
+        CHOICE=$(dialog --clear --title "DroidOS" \
+            --menu "\nWaydroid has exited. What would you like to do?" 13 52 4 \
+            1 "Continue to Waydroid" \
+            2 "Shut Down" \
+            3 "Restart" \
+            4 "Enter Shell" \
+            3>&1 1>&2 2>&3)
+    fi
+    clear
+
+    case "$CHOICE" in
+        2) poweroff ;;
+        3) reboot ;;
+        4) exec /bin/bash ;;
+        5) droidos-install ;;
+        *) ;;
+    esac
+done
+EOF
+chmod +x /root/runwaydroid.sh
+
+mkdir -p /root/.config
+cat > /root/.config/weston.ini << 'WESTON_EOF'
+[core]
+backend=drm
+idle-time=0
+shell=kiosk-shell.so
+
+[output]
+name=*
+mode=current
+WESTON_EOF
+
+cat > /usr/local/bin/droidos-weston << 'WESTON_SCRIPT_EOF'
+#!/bin/bash
+# pixman (CPU) renderer: avoids the DMA-BUF fence race that causes Z-line
+# tearing during animations when Waydroid hands frames to Weston on Intel.
+ARGS=(--config=/root/.config/weston.ini --renderer=pixman -- weston-terminal --shell=/root/runwaydroid.sh)
+
+run() { weston "${ARGS[@]}"; }
+
+T=$(date +%s)
+run
+if (( $? != 0 && $(date +%s) - T < 5 )); then
+    echo "droidos-weston: DRM backend failed quickly — retrying in 5 seconds"
+    sleep 5
+    exec run
+fi
+WESTON_SCRIPT_EOF
+chmod +x /usr/local/bin/droidos-weston
+
+cat > /root/.bash_profile << 'EOF'
+if [[ $(tty) == /dev/tty1 ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+  exec droidos-weston
+fi
+EOF
+
+cat > /usr/local/bin/droidos-audio << 'AUDIO_EOF'
+#!/bin/bash
+export XDG_RUNTIME_DIR=/run/user/0
+export HOME=/root
+export USER=root
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+
+/usr/bin/pipewire &
+PIPEWIRE_PID=$!
+for i in $(seq 1 40); do
+    [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
+    sleep 0.25
+done
+if [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+    echo "droidos-audio: pipewire socket never appeared" >&2
+    exit 1
+fi
+
+/usr/bin/wireplumber &
+WIREPLUMBER_PID=$!
+sleep 1
+/usr/bin/pipewire-pulse &
+PULSE_PID=$!
+
+for i in $(seq 1 60); do
+    [ -S "$XDG_RUNTIME_DIR/pulse/native" ] && break
+    sleep 0.5
+done
+if [ ! -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+    echo "droidos-audio: pulse socket never appeared" >&2
+    exit 1
+fi
+echo "droidos-audio: pipewire + pulse sockets ready"
+
+wait -n
+exit 1
+AUDIO_EOF
+chmod +x /usr/local/bin/droidos-audio
+
+# Bake build-time variables into the image so runtime scripts can read them
+mkdir -p /etc/droidos
+echo "DROIDOS_TYPE=${DROIDOS_TYPE:-MOBILE}" > /etc/droidos/config
+
+echo "[droidos-setup] Downloading Android images..."
+if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
+    echo "[droidos-setup] Android TV build selected."
+    waydroid init -c https://ota.supechicken666.dev/system \
+                  -v https://ota.supechicken666.dev/vendor -s GAPPS
+else
+    waydroid init -s VANILLA
+fi
+echo "[droidos-setup] Android images ready."
+
+# Make all apps see a WiFi connection; internet flows through the waydroid0 bridge
+sed -i '/^persist\.waydroid\.fake_wifi=/d' /var/lib/waydroid/waydroid_base.prop 2>/dev/null || true
+echo 'persist.waydroid.fake_wifi=*' >> /var/lib/waydroid/waydroid_base.prop
+
+git clone https://github.com/casualsnek/waydroid_script /opt/waydroid_script 2>/dev/null || true
+cd /opt/waydroid_script
+echo "[droidos-setup] Installing libhoudini (ARM support)..."
+python3 main.py install libhoudini && echo "[droidos-setup] libhoudini installed." \
+    || echo "[droidos-setup] WARNING: libhoudini install failed."
+echo "[droidos-setup] Installing GApps..."
+python3 main.py install gapps && echo "[droidos-setup] GApps installed." \
+    || echo "[droidos-setup] WARNING: GApps install failed."
+'''
+
+# Runs after extrachrootsteps.sh and extracustomization files are in place.
+# APKs the user placed in distro/extracustomization/var/lib/droidos/apks/ are
+# already at /var/lib/droidos/apks/ in the rootfs at this point.
+# We inject them directly into the Waydroid system image as system apps —
+# Android scans /system/app/ on first boot and installs everything it finds.
+Post-ExtraChrootSteps-Cmd = '''
+mkdir -p /var/lib/droidos/apks
+
+cat > /usr/local/bin/droidos-install-apks << 'APKS_EOF'
+#!/bin/bash
+APK_DIR=/var/lib/droidos/apks
+DONE_DIR=/var/lib/droidos/apks/.installed
+mkdir -p "$DONE_DIR"
+
+pending=0
+for apk in "$APK_DIR"/*.apk; do
+    [ -f "$apk" ] || continue
+    [ -f "$DONE_DIR/$(basename "$apk")" ] && continue
+    pending=1; break
+done
+[ $pending -eq 0 ] && exit 0
+
+echo "droidos: waiting for Android to boot before installing APKs..."
+for i in $(seq 1 60); do
+    waydroid prop get sys.boot_completed 2>/dev/null | grep -q '^1$' && break
+    sleep 3
+done
+
+for apk in "$APK_DIR"/*.apk; do
+    [ -f "$apk" ] || continue
+    name=$(basename "$apk")
+    [ -f "$DONE_DIR/$name" ] && continue
+    echo "droidos: installing $name..."
+    waydroid app install "$apk" \
+        && touch "$DONE_DIR/$name" \
+        || echo "droidos: WARNING: failed to install $name"
+done
+APKS_EOF
+chmod +x /usr/local/bin/droidos-install-apks
+
+cat > /usr/local/bin/droidos-install << 'INSTALLER_EOF'
+#!/bin/bash
+# DroidOS disk installer — only works from a live ISO.
+LIVE_ROOTFS=/run/mklive/rootfs
+
+if [ ! -d "$LIVE_ROOTFS" ]; then
+    dialog --title "DroidOS Installer" \
+        --msgbox "\nThis installer only works from a live DroidOS ISO." 7 50
+    exit 1
+fi
+
+dialog --title "DroidOS Installer" --msgbox "\
+\nWelcome to the DroidOS installer.\n\
+\nDroidOS will be installed to a disk you select.\n\
+All existing data on that disk will be erased." 10 54 || exit 0
+
+# Build disk list
+MENU_ARGS=()
+while read -r name size model; do
+    MENU_ARGS+=("/dev/$name" "$(printf '%-8s %s' "$size" "$model")")
+done < <(lsblk -d -n -o NAME,SIZE,MODEL | grep -Ev '^(loop|sr)')
+
+if [ ${#MENU_ARGS[@]} -eq 0 ]; then
+    dialog --title "DroidOS Installer" --msgbox "\nNo suitable disks found." 7 40
+    exit 1
+fi
+
+DISK=$(dialog --title "DroidOS Installer" \
+    --menu "\nSelect the disk to install DroidOS to:" 15 60 8 \
+    "${MENU_ARGS[@]}" 3>&1 1>&2 2>&3) || exit 0
+
+DISK_INFO="$(lsblk -d -n -o SIZE,MODEL "$DISK" | xargs)"
+
+dialog --title "DroidOS Installer" \
+    --yesno "\nInstall DroidOS to $DISK ($DISK_INFO)?\n\nALL DATA ON THIS DISK WILL BE PERMANENTLY ERASED." 10 56 || exit 0
+
+# Partition naming: nvme/mmcblk use p1/p2, others use 1/2
+if [[ "$DISK" =~ nvme|mmcblk ]]; then
+    EFI="${DISK}p1"; ROOT="${DISK}p2"
+else
+    EFI="${DISK}1";  ROOT="${DISK}2"
+fi
+
+MOUNT=/mnt/droidos-install
+LOG=$(mktemp /tmp/droidos-install-XXXXXX.log)
+DONE=$(mktemp /tmp/droidos-install-done-XXXXXX)
+rm "$DONE"
+
+cleanup() {
+    for d in dev/pts dev proc sys run; do umount "$MOUNT/$d" 2>/dev/null; done
+    umount "$MOUNT/boot" 2>/dev/null
+    umount "$MOUNT"      2>/dev/null
+}
+
+{
+    echo "5";  echo "# Partitioning $DISK..."
+    sgdisk --zap-all "$DISK"                              >> "$LOG" 2>&1 || exit 1
+    sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI"  "$DISK"   >> "$LOG" 2>&1 || exit 1
+    sgdisk -n 2:0:0     -t 2:8300 -c 2:"DroidOS" "$DISK" >> "$LOG" 2>&1 || exit 1
+    partx --update "$DISK" >> "$LOG" 2>&1; sleep 1
+
+    echo "15"; echo "# Formatting partitions..."
+    mkfs.vfat -F 32 -n EFI     "$EFI"  >> "$LOG" 2>&1 || exit 1
+    mkfs.ext4 -F    -L DroidOS "$ROOT" >> "$LOG" 2>&1 || exit 1
+
+    echo "20"; echo "# Mounting partitions..."
+    mkdir -p "$MOUNT"
+    mount "$ROOT" "$MOUNT"       >> "$LOG" 2>&1 || exit 1
+    mkdir -p "$MOUNT/boot"
+    mount "$EFI"  "$MOUNT/boot" >> "$LOG" 2>&1 || exit 1
+
+    echo "25"; echo "# Copying system (this takes a while)..."
+    rsync -a \
+        --exclude=/proc --exclude=/sys --exclude=/dev \
+        --exclude=/run  --exclude=/tmp --exclude=/mnt \
+        "$LIVE_ROOTFS/" "$MOUNT/"                        >> "$LOG" 2>&1 || exit 1
+
+    echo "75"; echo "# Configuring installed system..."
+    ROOT_UUID=$(findmnt -n -o UUID "$ROOT")
+    EFI_UUID=$(lsblk  -n -o UUID "$EFI")
+    printf 'UUID=%s  /      ext4  defaults   0 1\nUUID=%s  /boot  vfat  umask=0077  0 2\n' \
+        "$ROOT_UUID" "$EFI_UUID" > "$MOUNT/etc/fstab"
+
+    # Replace live-boot initramfs hooks with standard disk-boot hooks
+    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block filesystems keyboard fsck)/' \
+        "$MOUNT/etc/mkinitcpio.conf"
+
+    echo "80"; echo "# Regenerating initramfs..."
+    for d in proc sys dev dev/pts run; do mount --bind "/$d" "$MOUNT/$d"; done
+    chroot "$MOUNT" mkinitcpio -P >> "$LOG" 2>&1 || exit 1
+
+    echo "90"; echo "# Installing bootloader..."
+    chroot "$MOUNT" grub-install \
+        --target=x86_64-efi --efi-directory=/boot \
+        --bootloader-id=DroidOS --removable         >> "$LOG" 2>&1 || exit 1
+    chroot "$MOUNT" grub-mkconfig -o /boot/grub/grub.cfg >> "$LOG" 2>&1 || exit 1
+    # Ensure grub.cfg uses the installed root UUID, not the live one
+    sed -i "s|root=UUID=[^ ]*|root=UUID=$ROOT_UUID|g" "$MOUNT/boot/grub/grub.cfg"
+
+    echo "98"; echo "# Cleaning up..."
+    cleanup
+    touch "$DONE"
+    echo "100"; echo "# Done!"
+} | dialog --title "DroidOS Installer" --gauge "Installing DroidOS to $DISK..." 8 60 0
+
+if [ ! -f "$DONE" ]; then
+    cleanup 2>/dev/null
+    dialog --title "DroidOS Installer — Installation Failed" --textbox "$LOG" 20 72
+    rm -f "$LOG" "$DONE"
+    exit 1
+fi
+
+rm -f "$LOG" "$DONE"
+dialog --title "DroidOS Installer" \
+    --msgbox "\nDroidOS installed successfully!\n\nRemove the USB drive and press Enter to reboot." 9 54
+reboot
+INSTALLER_EOF
+chmod +x /usr/local/bin/droidos-install
+
+# Customize Android device identity shown in Settings and app device checks.
+PROP_FILE=/var/lib/waydroid/waydroid_base.prop
+if [ -f "$PROP_FILE" ]; then
+    for prop in ro.product.manufacturer ro.product.brand ro.product.name ro.product.device ro.product.model; do
+        sed -i "/^${prop}=/d" "$PROP_FILE"
+    done
+    cat >> "$PROP_FILE" << 'PROPS_EOF'
+ro.product.manufacturer=mkmelinux
+ro.product.brand=mkmelinux
+ro.product.name=droidos
+ro.product.device=droidos
+ro.product.model=DroidOS
+PROPS_EOF
+
+    # Android TV locks to a fixed render resolution. If that resolution produces
+    # a non-64-byte-aligned stride on the Intel iGPU, the display engine reads
+    # rows at the wrong offset and produces a diagonal Z-pattern tear. Force a
+    # known stride-safe resolution (1920×1080 → 7680 bytes/row at 32bpp) to
+    # avoid this on Intel hardware.
+    if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
+        sed -i '/^ro\.waydroid\.display_width=/d;/^ro\.waydroid\.display_height=/d' "$PROP_FILE"
+        printf 'ro.waydroid.display_width=1920\nro.waydroid.display_height=1080\n' >> "$PROP_FILE"
+    fi
+
+    echo "droidos: device props set."
+fi
+'''
+
+# Arch uses mkinitcpio, not update-initramfs.
+Regenerate-Initramfs-Cmd = "mkinitcpio -P || true"
+
+# Install a minimal live boot hook so the initramfs can find the squashfs on
+# the ISO, set up an overlayfs writable layer, and switch root into it.
+# The standard Arch initramfs only knows how to boot from a real disk partition.
+ISO-Pre-Initramfs-Cmd = '''
+mkdir -p /etc/initcpio/hooks /etc/initcpio/install
+
+cat > /etc/initcpio/hooks/mklive << 'HOOK_EOF'
+run_hook() {
+    local img="/live/rootfs.squashfs"
+    mkdir -p /run/mklive/medium /run/mklive/rootfs /run/mklive/overlay
+
+    # Read the ISO volume label from kernel cmdline (set by the GRUB entry).
+    # Use /dev/disk/by-label/ — a udev symlink — exactly as the real archiso
+    # mkinitcpio hook does. blkid is not needed and unreliable here.
+    local label="MKLIVE"
+    for _p in $(cat /proc/cmdline); do
+        case "$_p" in mklive.label=*) label="${_p#mklive.label=}";; esac
+    done
+
+    echo "mklive: looking for label='${label}' img='${img}'"
+    echo "mklive: kernel cmdline: $(cat /proc/cmdline)"
+
+    local dev="/dev/disk/by-label/${label}"
+    local found="" retries=0
+    while [ -z "$found" ] && [ "$retries" -lt 30 ]; do
+        echo "mklive: attempt $((retries + 1))/30"
+        echo "mklive: /dev/disk/by-label: $(ls /dev/disk/by-label/ 2>&1)"
+        echo "mklive: block devices: $(ls /dev/sr* /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null | tr '\n' ' ')"
+
+        # Primary: find by udev volume-label symlink.
+        if [ -b "$dev" ]; then
+            echo "mklive: trying by-label device ${dev}..."
+            if mount -r "$dev" /run/mklive/medium 2>/dev/null; then
+                if [ -f "/run/mklive/medium${img}" ]; then
+                    echo "mklive: found squashfs via by-label"
+                    found="$dev"
+                else
+                    echo "mklive: mounted ${dev} but no squashfs — contents: $(ls /run/mklive/medium/ 2>&1)"
+                    umount /run/mklive/medium 2>/dev/null
+                fi
+            else
+                echo "mklive: mount of ${dev} failed"
+            fi
+        fi
+
+        # Fallback: scan raw CD-ROM device nodes directly.
+        if [ -z "$found" ]; then
+            for rawdev in /dev/sr0 /dev/sr1 /dev/sr2 /dev/sda /dev/sdb /dev/vda; do
+                [ -b "$rawdev" ] || continue
+                echo "mklive: trying raw device ${rawdev}..."
+                if mount -r "$rawdev" /run/mklive/medium 2>/dev/null; then
+                    if [ -f "/run/mklive/medium${img}" ]; then
+                        echo "mklive: found squashfs on ${rawdev}"
+                        found="$rawdev"
+                        break
+                    else
+                        echo "mklive: ${rawdev} mounted but no squashfs — contents: $(ls /run/mklive/medium/ 2>&1)"
+                        umount /run/mklive/medium 2>/dev/null
+                    fi
+                fi
+            done
+        fi
+
+        [ -z "$found" ] && { retries=$((retries + 1)); sleep 1; }
+    done
+
+    if [ -z "$found" ]; then
+        echo "mklive: ERROR: boot medium not found after 30 attempts" >&2
+        echo "mklive: final /dev/disk/by-label: $(ls /dev/disk/by-label/ 2>&1)" >&2
+        echo "mklive: final /dev: $(ls /dev/ | grep -E '^(sd|sr|vd|nvme|loop)' | tr '\n' ' ')" >&2
+        return 1
+    fi
+
+    echo "mklive: mounting squashfs from /run/mklive/medium${img}..."
+    mount -r -t squashfs "/run/mklive/medium${img}" /run/mklive/rootfs
+    echo "mklive: preparing overlay tmpfs..."
+    mount -t tmpfs tmpfs /run/mklive/overlay
+    mkdir -p /run/mklive/overlay/upper /run/mklive/overlay/work
+
+    # Override mkinitcpio's default mount_handler. The init script calls
+    # "${mount_handler}" /new_root *after* hooks finish — its default would
+    # try to mount $root (empty for us) onto /new_root, clobbering anything
+    # we already mounted there. Pointing mount_handler at our own function is
+    # the supported way to take over the root mount.
+    mount_handler="mklive_mount_handler"
+    echo "mklive: hook done, mount_handler set."
+}
+
+mklive_mount_handler() {
+    local newroot="$1"
+    echo "mklive: mount_handler mounting overlay on ${newroot}..."
+    mount -t overlay overlay \
+        -o lowerdir=/run/mklive/rootfs,upperdir=/run/mklive/overlay/upper,workdir=/run/mklive/overlay/work \
+        "$newroot"
+    echo "mklive: overlay mounted on ${newroot}, switching root."
+}
+HOOK_EOF
+
+cat > /etc/initcpio/install/mklive << 'INSTALL_EOF'
+build() {
+    add_module loop
+    add_module squashfs
+    add_module overlay
+    add_module iso9660
+    add_runscript
+}
+INSTALL_EOF
+
+# Drop autodetect — in a build chroot it only whitelists modules loaded on the
+# host, so sr_mod (CD-ROM driver) and iso9660 never make it into the initramfs.
+# Without autodetect the block hook includes ALL block device drivers, which is
+# what a live ISO needs since it must be able to boot on any hardware.
+# Explicitly list the filesystem modules since block hook does not cover those.
+systemctl enable dhcpcd
+
+sed -i 's/^MODULES=.*/MODULES=(loop squashfs overlay iso9660 sr_mod sd_mod)/' /etc/mkinitcpio.conf
+sed -i 's/^HOOKS=.*/HOOKS=(base udev modconf block mklive)/' /etc/mkinitcpio.conf
+'''
+
+# Arch names its kernel and initramfs differently from Debian.
+Vmlinuz-Name = "vmlinuz-linux-zen"
+Initramfs-Name = "initramfs-linux-zen.img"

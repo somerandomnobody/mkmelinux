@@ -1,0 +1,6 @@
+venv/
+.claude/
+rootfs/
+iso/
+output/
+linux.iso

@@ -1,0 +1,92 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'distro/**'
+      - 'mkmelinux.sh'
+      - 'runinpodman.sh'
+      - 'globalpatches/**'
+      - 'distro-templates/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Required for HARDDISK builds — Incus launches a VM inside the Podman container
+      # and needs this kernel module for the vsock channel. Safe to ignore on ISO/V86 builds.
+      # GitHub-hosted runners have /dev/kvm available and pass it through --privileged Podman,
+      # but vhost_vsock is not guaranteed — if missing, HARDDISK builds may fail at the Incus step.
+      - name: Load vhost_vsock module
+        run: sudo modprobe vhost_vsock || true
+
+      - name: Install host tools
+        run: sudo apt-get install -y --no-install-recommends qemu-utils zip
+
+      - name: Build distro
+        run: bash runinpodman.sh
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=build-$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect and publish artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.value }}"
+          UPLOADS=()
+
+          # ISO image
+          if [ -f linux.iso ]; then
+            echo "Found linux.iso"
+            UPLOADS+=(linux.iso)
+          fi
+
+          # VM disk — prefer an already-converted QCOW2 (from .after_hook.sh),
+          # otherwise convert the raw image now.
+          if [ -f harddisk.qcow2 ]; then
+            echo "Found harddisk.qcow2"
+            UPLOADS+=(harddisk.qcow2)
+          elif [ -f harddisk.img ]; then
+            echo "Found harddisk.img — converting to QCOW2..."
+            qemu-img convert -f raw -O qcow2 harddisk.img harddisk.qcow2
+            UPLOADS+=(harddisk.qcow2)
+          fi
+
+          # v86 browser VM output directory
+          if [ -d output ]; then
+            echo "Found output/ — zipping..."
+            zip -r v86-output.zip output/
+            UPLOADS+=(v86-output.zip)
+          fi
+
+          if [ ${#UPLOADS[@]} -eq 0 ]; then
+            echo "::error::No build artifacts found — did the build succeed?"
+            exit 1
+          fi
+
+          echo "Uploading: ${UPLOADS[*]}"
+          gh release create "$TAG" "${UPLOADS[@]}" \
+            --title "Build $TAG" \
+            --notes "Automated build from commit \`${{ github.sha }}\` on branch \`${{ github.ref_name }}\`."
