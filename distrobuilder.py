@@ -2139,6 +2139,11 @@ class RootfsDialog(ModalScreen[bool]):
                 "Making a new one ensures a completely clean build.",
                 classes="msg",
             )
+            yield Static(
+                "If you switched to a different OS template, pick 'Make a new one' — "
+                "the build refuses a rootfs made for a different distro.",
+                classes="msg",
+            )
             if self.is_v86:
                 yield Static(
                     "WARNING: v86 requires a 32-bit rootfs. "

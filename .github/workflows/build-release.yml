@@ -58,25 +58,21 @@ jobs:
           UPLOADS=()
 
           # ISO image
-          if [ -f linux.iso ]; then
-            echo "Found linux.iso"
-            UPLOADS+=(linux.iso)
+          if [ -f output/linux.iso ]; then
+            echo "Found output/linux.iso"
+            UPLOADS+=(output/linux.iso)
           fi
 
-          # VM disk — prefer an already-converted QCOW2 (from .after_hook.sh),
-          # otherwise convert the raw image now.
-          if [ -f harddisk.qcow2 ]; then
-            echo "Found harddisk.qcow2"
-            UPLOADS+=(harddisk.qcow2)
-          elif [ -f harddisk.img ]; then
-            echo "Found harddisk.img — converting to QCOW2..."
-            qemu-img convert -f raw -O qcow2 harddisk.img harddisk.qcow2
+          # VM disk — convert the raw image to QCOW2 for distribution.
+          if [ -f output/harddisk.img ]; then
+            echo "Found output/harddisk.img — converting to QCOW2..."
+            qemu-img convert -f raw -O qcow2 output/harddisk.img harddisk.qcow2
             UPLOADS+=(harddisk.qcow2)
           fi
 
-          # v86 browser VM output directory
-          if [ -d output ]; then
-            echo "Found output/ — zipping..."
+          # v86 browser VM — detected by presence of index.html in output/
+          if [ -f output/index.html ]; then
+            echo "Found v86 output/ — zipping..."
             zip -r v86-output.zip output/
             UPLOADS+=(v86-output.zip)
           fi
@@ -86,7 +82,14 @@ jobs:
             exit 1
           fi
 
+          NOTES="Automated build from commit \`${{ github.sha }}\` on branch \`${{ github.ref_name }}\`."
+          if [ -f distro/description.txt ]; then
+            NOTES="$NOTES
+
+$(cat distro/description.txt)"
+          fi
+
           echo "Uploading: ${UPLOADS[*]}"
           gh release create "$TAG" "${UPLOADS[@]}" \
             --title "Build $TAG" \
-            --notes "Automated build from commit \`${{ github.sha }}\` on branch \`${{ github.ref_name }}\`."
+            --notes "$NOTES"

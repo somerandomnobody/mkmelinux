@@ -37,6 +37,7 @@ for arg in "$@"; do
 done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTDIR="$SCRIPT_DIR/output"
 
 # ── Emergency chroot ──────────────────────────────────────────────────────────
 # EMERG_CHROOT bypasses the normal build and drops straight into a shell (or a
@@ -265,6 +266,14 @@ RESET=$(tput sgr0)
 # Set after tput so that a tput failure in Podman does not abort the script.
 set -euo pipefail
 
+# ── Build log ─────────────────────────────────────────────────────────────────
+
+mkdir -p "$SCRIPT_DIR/logs"
+_LOGFILE="$SCRIPT_DIR/logs/build-$(date -u +%Y%m%d-%H%M%S).log"
+exec > >(tee "$_LOGFILE") 2>&1
+_BUILD_START=$(date -u +%s)
+echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Build started — TYPE=${TYPE} HOSTNAME=${GENERATE_HOSTNAME}"
+
 # ── Privilege setup ───────────────────────────────────────────────────────────
 
 echo "${GREEN}[INFO]${RESET} Working Directory: ${PWD}"
@@ -286,6 +295,7 @@ fi
 _EXIT_CONTENT=""
 _exit_done=0
 _on_exit_cleanup() {
+    local _exit_code=$?
     if [[ -n "$_EXIT_CONTENT" ]] && (( ! _exit_done )); then
         _exit_done=1
         echo "${YELLOW}[WARN]${RESET} Running Exit-Chroot-Cmd on exit..."
@@ -295,6 +305,12 @@ _on_exit_cleanup() {
         $SUDO bash "$tmp" || true
         rm -f "$tmp"
     fi
+    local _elapsed=$(( $(date -u +%s) - _BUILD_START ))
+    if (( _exit_code == 0 )); then
+        echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Build finished successfully in ${_elapsed}s."
+    else
+        echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Build failed (exit ${_exit_code}) after ${_elapsed}s."
+    fi
 }
 trap '_on_exit_cleanup' EXIT
 
@@ -302,19 +318,56 @@ trap '_on_exit_cleanup' EXIT
 
 echo "${GREEN}[INFO]${RESET} Cleaning old build artifacts..."
 if [[ $TYPE == "ISO" ]]; then
-    $SUDO rm -f ./linux.iso ./rootfs.squashfs
+    $SUDO rm -f "$OUTDIR/linux.iso" ./rootfs.squashfs
 elif [[ $TYPE == "HARDDISK" ]]; then
-    $SUDO rm -f ./harddisk.img ./harddisk.qcow2
+    $SUDO rm -f "$OUTDIR/harddisk.img"
 elif [[ $TYPE == "V86" ]]; then
     $SUDO rm -f ./rootfs-v86.tar
 fi
 
 if [[ "${GENERATE_NEW_ROOTFS:-}" == "YES" ]]; then
     echo "${GREEN}[INFO]${RESET} Removing old rootfs..."
+    # A previously aborted build can leave chroot bind mounts (/proc, /sys,
+    # /dev) behind inside ./rootfs — rm -rf must never recurse into those.
+    if [[ -d ./rootfs ]]; then
+        $SUDO umount -R ./rootfs 2>/dev/null || true
+        mount | awk -v d="$(pwd)/rootfs" '$3 ~ d {print $3}' | sort -r | while read -r m; do
+            $SUDO umount "$m" 2>/dev/null || true
+        done
+    fi
     $SUDO rm -rf ./rootfs
     $SUDO rm -rf ./iso
 else
     echo "${GREEN}[INFO]${RESET} Will use old rootfs if one already exists."
+fi
+
+# ── Rootfs identity check ─────────────────────────────────────────────────────
+# Reusing a ./rootfs left over from a different distro template (or Debian
+# variant) fails in confusing ways — e.g. Alpine's Setup-Chroot-Cmd reporting
+# that /sbin/apk does not exist inside what is actually a NixOS rootfs. Record
+# what created the rootfs and refuse an obvious mismatch up front.
+
+if (( USING_TEMPLATE )); then
+    _ROOTFS_ID="template:${OSTEMPLATE}"
+else
+    _ROOTFS_ID="debian:${OSTYPE}"
+    [[ $TYPE == "V86" ]] && _ROOTFS_ID="${_ROOTFS_ID}:i386"
+fi
+_ROOTFS_ID_FILE="./.mkmelinux-rootfs-id"
+
+if [[ -d ./rootfs ]] && [[ "${GENERATE_NEW_ROOTFS:-}" != "YES" ]]; then
+    if [[ -f "$_ROOTFS_ID_FILE" ]]; then
+        _existing_id=$(<"$_ROOTFS_ID_FILE")
+        if [[ "$_existing_id" != "$_ROOTFS_ID" ]]; then
+            echo "${RED}[ ERR ]${RESET} The existing ./rootfs was created for '${_existing_id}', but this build needs '${_ROOTFS_ID}'."
+            echo "${RED}[ ERR ]${RESET} Reusing it would fail in confusing ways. Set GENERATE_NEW_ROOTFS=YES to rebuild it"
+            echo "${RED}[ ERR ]${RESET} (in the TUI: answer 'Make a new one' when asked about the existing rootfs)."
+            exit 1
+        fi
+    else
+        echo "${YELLOW}[WARN]${RESET} Existing ./rootfs has no identity marker (made by an older mkmelinux?)."
+        echo "${YELLOW}[WARN]${RESET} Make sure it really is a '${_ROOTFS_ID}' rootfs, or set GENERATE_NEW_ROOTFS=YES."
+    fi
 fi
 
 # ── Download / bootstrap rootfs ───────────────────────────────────────────────
@@ -337,6 +390,7 @@ if [[ "${GENERATE_NEW_ROOTFS:-}" == "YES" ]] || ! [[ -d ./rootfs ]]; then
             $SUDO debootstrap $ARCH_FLAG stable rootfs http://deb.debian.org/debian/
         fi
     fi
+    echo "$_ROOTFS_ID" > "$_ROOTFS_ID_FILE"
 fi
 
 # ── Set hostname ──────────────────────────────────────────────────────────────
@@ -438,6 +492,8 @@ else
     if (( ! USING_TEMPLATE )); then
         $SUDO chroot ./rootfs bash -c "apt install busybox -y" || true
     fi
+    # Non-fatal: not every rootfs can run this (NixOS has no /usr/bin and
+    # manages /etc declaratively — its template configures autologin itself).
     $SUDO chroot ./rootfs bash -c '
 mkdir -p /etc/systemd/system/getty@tty1.service.d/
 cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << EOF
@@ -445,7 +501,7 @@ cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << EOF
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 EOF
-'
+' || true
     # Unlock the root account (Arch ships it locked by default; Debian leaves
     # it without a password but locked). With "passwd -d", root can log in
     # with an empty password — matching the autologin behavior.
@@ -460,7 +516,8 @@ if [[ -d "./globalpatches" ]]; then
         echo "${GREEN}+ Running: ${RESET} ${script}"
         cp "$script" ./rootfs/patch.sh
         $SUDO chroot ./rootfs bash -c "PATH=$PATH:/usr/sbin bash /patch.sh" || true
-        $SUDO chroot ./rootfs bash -c "rm /patch.sh"
+        # Delete from outside the chroot — minimal rootfses may lack rm in PATH.
+        $SUDO rm -f ./rootfs/patch.sh
         echo "${GREEN}+ Done running: ${RESET} ${script}"
     done
 else
@@ -537,29 +594,35 @@ if [[ $TYPE == "ISO" ]]; then
     fi
     $SUDO mv ./rootfs.squashfs ./iso/live
     echo "${GREEN}[INFO]${RESET} Writing GRUB config..."
+    _EXTRA_CMDLINE=""
+    if (( USING_TEMPLATE )) && dt_has "DistroConfig.Grub-Extra-Cmdline"; then
+        _EXTRA_CMDLINE=" $(dt "DistroConfig.Grub-Extra-Cmdline")"
+    fi
     cat > ./iso/boot/grub/grub.cfg << EOF
 set timeout=5
 set default=0
 
 menuentry "Linux ${GENERATE_HOSTNAME}" {
-    linux /boot/vmlinuz boot=live mklive.label=MKLIVE
+    linux /boot/vmlinuz boot=live mklive.label=MKLIVE${_EXTRA_CMDLINE}
     initrd /boot/initrd.img
 }
 EOF
     echo "${GREEN}[INFO]${RESET} Assembling ISO..."
-    $SUDO grub-mkrescue -o ./linux.iso ./iso
+    mkdir -p "$OUTDIR"
+    $SUDO grub-mkrescue -o "$OUTDIR/linux.iso" ./iso
     # Patch the ISO 9660 Primary Volume Descriptor to set volume label MKLIVE.
     # The PVD sits at sector 16 (byte 32768); Volume Identifier is at PVD offset 40.
     # This lets udev create /dev/disk/by-label/MKLIVE so the initramfs hook can find
     # the boot medium — the same mechanism the real archiso mkinitcpio hook uses.
-    printf '%-32.32s' 'MKLIVE' | $SUDO dd of=./linux.iso bs=1 seek=32808 conv=notrunc 2>/dev/null
-    echo "${GREEN}[INFO]${RESET} Finished! ISO is ready at ./linux.iso."
+    printf '%-32.32s' 'MKLIVE' | $SUDO dd of="$OUTDIR/linux.iso" bs=1 seek=32808 conv=notrunc 2>/dev/null
+    echo "${GREEN}[INFO]${RESET} Finished! ISO is ready at output/linux.iso."
 
 elif [[ $TYPE == "HARDDISK" ]]; then
     echo "${GREEN}[INFO]${RESET} Generating harddisk .img image of ${VHD_SIZE} Gigabytes..."
-    $SUDO truncate -s ${VHD_SIZE}G ${PWD}/harddisk.img
+    mkdir -p "$OUTDIR"
+    $SUDO truncate -s ${VHD_SIZE}G "$OUTDIR/harddisk.img"
     echo "${GREEN}[INFO]${RESET} Setting up loop device..."
-    LOOP_DEV=$($SUDO losetup -f --show ${PWD}/harddisk.img)
+    LOOP_DEV=$($SUDO losetup -f --show "$OUTDIR/harddisk.img")
     echo "${GREEN}[INFO]${RESET} Partition edit: Making 512MB EFI partition and filling the rest with ext4..."
     (echo g; echo n; echo 1; echo; echo +512M; echo t; echo 1; echo n; echo 2; echo; echo; echo w) | $SUDO fdisk ${LOOP_DEV}
     echo "${GREEN}[INFO]${RESET} Attempting to refresh partitions..."
@@ -595,7 +658,8 @@ elif [[ $TYPE == "HARDDISK" ]]; then
     $SUDO umount /ext4part
     echo "${GREEN}[INFO]${RESET} Detaching loop device..."
     $SUDO losetup -d ${LOOP_DEV}
-    echo "${GREEN}[INFO]${RESET} Finished! VM disk is ready at ./harddisk.img."
+    echo "${GREEN}[INFO]${RESET} Finished! Disk image is ready at output/harddisk.img."
+    echo "${GREEN}[INFO]${RESET} Flash to a drive with: dd if=output/harddisk.img of=/dev/sdX bs=4M status=progress"
 
 elif [[ $TYPE == "V86" ]]; then
     echo "${GREEN}[INFO]${RESET} Exporting 32-bit rootfs as tar..."

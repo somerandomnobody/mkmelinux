@@ -3,11 +3,7 @@ Distro Templates are **TOML** formatted files, that correspond to how mkmelinux 
 
 ## NOTE: This is **NOT** where you customize your distro. This is where you set up a base distribution for customization. For customizing a distro, use the distro/ folder.
 
-For now, Arch Linux is supported. Future distros to be supported include:
-- NixOS
-- Alpine Linux
-- Android x86 (Supported partially with droidos.dt.)
-- Potentially Fedora Atomic
+For now, Arch Linux is supported, Alpine Linux is supported with alpine.dt (ISO and HARDDISK builds), NixOS is supported with nixos.dt (ISO builds only — customize by overwriting /etc/nixos/configuration.nix; start from resources/nixos-configuration-template.nix and see the comments in nixos.dt), Fedora Atomic is supported with fedora-atomic.dt (ISO builds only — built from the official fedora-bootc base image; customize with dnf in extrachrootsteps.sh, and pass DT.FEDORA_BOOTC_IMAGE=... to pin a release), and Android x86 is supported partially with droidos.dt.
 
 ## Parameters
 

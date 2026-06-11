@@ -1,0 +1,155 @@
+[DistroInfo]
+DistroName = "Fedora Atomic"
+Arch = "x64"
+Description = "Image-based Fedora from the fedora-bootc base image (the Fedora Atomic foundation)."
+Supporting = ["ISO"]
+
+[ContainerConfig]
+Packages = ["skopeo", "jq", "zstd", "ca-certificates"]
+
+# ── How this template works ───────────────────────────────────────────────────
+# Fedora Atomic systems are image-based: the OS ships as a bootable container
+# image instead of being assembled from packages. This template builds on
+# quay.io/fedora/fedora-bootc — the official base image of the Fedora Atomic
+# family (Silverblue, Kinoite, CoreOS, IoT all derive from it). Unlike a
+# normal distro container image, fedora-bootc contains a complete bootable
+# Fedora: kernel, systemd, NetworkManager, dnf, dracut.
+#
+#   * The rootfs is produced by pulling the OCI image with skopeo and
+#     extracting its layers in manifest order (with whiteout handling), the
+#     same flattening a container runtime performs. Customizing the chroot
+#     with dnf afterwards mirrors how Fedora Atomic images are customized in
+#     a Containerfile.
+#   * The live ISO boots with Fedora's own dracut dmsquash-live module — the
+#     mechanism real Fedora live ISOs use. It supports a "flattened squashfs"
+#     root (exactly what mkmelinux produces) when rd.live.overlay.overlayfs=1
+#     is set, mounting the squashfs read-only under an overlayfs writable
+#     layer. The kernel arguments are injected via Grub-Extra-Cmdline.
+#   * The kernel lives at /usr/lib/modules/<kver>/vmlinuz in bootc images
+#     (there is no populated /boot); Regenerate-Initramfs-Cmd copies it to
+#     /boot/vmlinuz-fedora so the standard packaging step finds it.
+#   * SELinux is disabled via kernel cmdline: tar extraction and mksquashfs
+#     do not preserve SELinux labels, and an unlabeled filesystem with
+#     SELinux enforcing will not boot.
+#
+# In extrachrootsteps.sh, use dnf (not apt):  dnf -y install htop
+# Note: /root and /home are symlinks into /var (var/roothome, var/home) —
+# this is normal for bootc images and already scaffolded by this template.
+#
+# Pass DT.FEDORA_BOOTC_IMAGE=quay.io/fedora/fedora-bootc:43 (or any other
+# bootc-compatible image reference) to build from a specific release; the
+# default is the "latest" tag, which tracks the newest stable Fedora.
+#
+# HARDDISK builds are not supported: mkmelinux's disk path runs grub-install
+# --target=x86_64-efi inside the chroot, which Fedora's grub2 build refuses
+# (Fedora installs prebuilt EFI binaries from grub2-efi-x64 instead).
+
+[DistroConfig]
+
+# Pull the bootc OCI image with skopeo and flatten its layers into ./rootfs.
+# The dir: transport stores each layer blob as a file named by its hex digest
+# next to manifest.json. Layers must be applied in manifest order; whiteout
+# entries (.wh.<name> / .wh..wh..opq) mark deletions from lower layers, and
+# --keep-directory-symlink keeps usr-merge symlinks (/bin -> usr/bin, ...)
+# intact when later layers carry directory entries for them.
+Download-Rootfs-Cmd = '''
+set -e
+image="${FEDORA_BOOTC_IMAGE:-quay.io/fedora/fedora-bootc:latest}"
+echo "Pulling ${image}..."
+rm -rf ./fedora-oci
+skopeo copy --override-os linux --override-arch amd64 \
+    "docker://${image}" dir:./fedora-oci
+
+mkdir -p ./rootfs
+for digest in $(jq -r '.layers[].digest' ./fedora-oci/manifest.json); do
+    blob="./fedora-oci/${digest#sha256:}"
+    echo "Extracting layer ${digest#sha256:}..."
+    # Apply whiteouts from this layer before extracting its content.
+    tar -tf "$blob" | grep -E '(^|/)\.wh\.' | while IFS= read -r wh; do
+        name=$(basename "$wh"); dir=$(dirname "$wh")
+        if [ "$name" = ".wh..wh..opq" ]; then
+            rm -rf "./rootfs/${dir:?}"/* 2>/dev/null || true
+        else
+            rm -rf "./rootfs/${dir:?}/${name#.wh.}"
+        fi
+    done || true
+    tar -xf "$blob" -C ./rootfs --keep-directory-symlink \
+        --exclude='.wh.*' --exclude='*/.wh.*'
+done
+rm -rf ./fedora-oci
+
+# bootc images ship /var nearly empty (systemd-tmpfiles populates it at
+# boot) and point /root and /home into it — scaffold what the build chroot
+# and user-creation steps need now.
+mkdir -p ./rootfs/var/roothome ./rootfs/var/home ./rootfs/var/tmp \
+         ./rootfs/var/log ./rootfs/var/cache ./rootfs/boot
+chmod 1777 ./rootfs/var/tmp
+chmod 700 ./rootfs/var/roothome
+# The hostname step does `rm /etc/hostname && echo ...` — make sure it exists.
+echo localhost > ./rootfs/etc/hostname
+'''
+
+# /etc/resolv.conf in the image is a symlink into /run (systemd-resolved) —
+# replace it with a real file we can bind the build container's one over.
+Setup-Chroot-Cmd = '''
+mount --bind ./rootfs ./rootfs
+mount -t proc none ./rootfs/proc
+mount --bind /sys ./rootfs/sys
+mount --bind /dev ./rootfs/dev
+mount --bind /dev/pts ./rootfs/dev/pts
+rm -f ./rootfs/etc/resolv.conf
+touch ./rootfs/etc/resolv.conf
+mount --bind /etc/resolv.conf ./rootfs/etc/resolv.conf
+'''
+
+Exit-Chroot-Cmd = '''
+umount ./rootfs/etc/resolv.conf
+umount ./rootfs/dev/pts
+umount ./rootfs/dev
+umount ./rootfs/sys
+umount ./rootfs/proc
+umount ./rootfs
+'''
+
+# The base image already contains everything bootable; only dracut-live
+# (the dmsquash-live initramfs module Fedora live ISOs use) is added.
+# dnf works in the chroot exactly as it does in a bootc Containerfile build.
+ISO-Install-Base-Packages-Cmd = '''
+set -e
+echo "Setting up Fedora Atomic..."
+dnf -y install dracut-live
+# The squashed tree carries no SELinux labels — keep it disabled on-disk
+# too, matching the selinux=0 kernel argument on the GRUB entry.
+sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config 2>/dev/null || true
+'''
+
+# Generic (non-hostonly) initramfs with the live-boot modules. dmsquash-live
+# detects our flattened squashfs (a /proc directory at its root instead of a
+# LiveOS/ image) and requires the overlayfs module for the writable layer.
+ISO-Pre-Initramfs-Cmd = '''
+mkdir -p /etc/dracut.conf.d
+cat > /etc/dracut.conf.d/mklive.conf << 'CONF_EOF'
+hostonly="no"
+add_dracutmodules+=" dmsquash-live overlayfs "
+filesystems+=" squashfs overlay iso9660 "
+CONF_EOF
+'''
+
+# bootc images keep the kernel under /usr/lib/modules/<kver>/, not /boot —
+# copy it out so the ISO packaging step can pick it up by name.
+Regenerate-Initramfs-Cmd = '''
+set -e
+KVER=$(ls /usr/lib/modules | head -n 1)
+[ -n "$KVER" ] || { echo "ERROR: no kernel found in /usr/lib/modules"; exit 1; }
+mkdir -p /boot
+cp "/usr/lib/modules/$KVER/vmlinuz" /boot/vmlinuz-fedora
+dracut --force --no-hostonly --kver "$KVER" /boot/initramfs-fedora.img
+'''
+
+# dmsquash-live kernel arguments: find the medium by the MKLIVE ISO label
+# (mkmelinux patches it into the ISO), use /live/rootfs.squashfs as the
+# flattened root, overlay a writable layer, and boot with SELinux off.
+Grub-Extra-Cmdline = "root=live:CDLABEL=MKLIVE rd.live.dir=live rd.live.squashimg=rootfs.squashfs rd.live.overlay.overlayfs=1 selinux=0"
+
+Vmlinuz-Name = "vmlinuz-fedora"
+Initramfs-Name = "initramfs-fedora.img"

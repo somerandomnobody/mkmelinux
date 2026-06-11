@@ -1,6 +1,9 @@
 venv/
 .claude/
+__pycache__/
 rootfs/
+.mkmelinux-rootfs-id
 iso/
 output/
 linux.iso
+logs/

@@ -1,0 +1,450 @@
+[DistroInfo]
+DistroName = "NixOS"
+Arch = "x64"
+Description = "NixOS live ISO. Customize by overwriting /etc/nixos/configuration.nix and rebuilding."
+Supporting = ["ISO"]
+
+[ContainerConfig]
+Packages = ["curl", "squashfs-tools"]
+
+# ── How this template works ───────────────────────────────────────────────────
+# NixOS has no debootstrap/pacstrap and no mkinitcpio, so this template differs
+# from the Debian/Arch flow:
+#
+#   * The base rootfs is the official NixOS system-container image from
+#     images.linuxcontainers.org (a full NixOS userland, no kernel).
+#   * Packages needed to BOOT (kernel, static busybox, kmod, xz, zstd) are
+#     installed with `nix-env -iA` into root's profile. nix-env profiles are
+#     garbage-collector roots and are independent of the system profile, so
+#     these survive both user rebuilds and `nix-collect-garbage`.
+#   * The live initramfs is built by hand from the static busybox: it loads
+#     storage modules, finds the boot medium, mounts the squashfs + a tmpfs
+#     overlay, and hands over to NixOS's own stage-2 init
+#     (/nix/var/nix/profiles/system/init).
+#   * The system itself is configured the NixOS way, but the mkmelinux boot
+#     glue (kernel/initrd/bootloader disabled, the overlay "/" stub, an
+#     autologin getty by default) lives in /etc/nixos/mkmelinux-base.nix and
+#     is merged in via a wrapper (/etc/nixos/mkmelinux-build.nix) that
+#     nixos-mkmelinux-rebuild regenerates on every run. The glue uses
+#     lib.mkForce, so /etc/nixos/configuration.nix can be ANY valid NixOS
+#     configuration and the image still boots to a prompt. To customize,
+#     overwrite configuration.nix (via extracustomization/) — start from
+#     resources/nixos-configuration-template.nix, which documents the
+#     pitfalls of configs copied from flake-based starter templates
+#     (`inputs` args, hardware-configuration.nix imports, display
+#     managers) — or do nothing:
+#     Post-ExtraChrootSteps-Cmd rebuilds once more and re-asserts the boot
+#     packages with `nix-env -iA` regardless of what the user changed.
+#
+# In extrachrootsteps.sh, remember that NixOS does not have /usr/bin — the
+# chroot PATH starts effectively empty. Start your script with:
+#     . /root/.mkmelinux-nix-env.sh
+#
+# Known limitations: kernel module autoloading via udev is limited at runtime
+# (the kernel lives outside the system profile), so the initramfs preloads
+# common storage and wired-ethernet drivers. WiFi needs firmware and is out of
+# scope for the default image.
+
+[DistroConfig]
+
+# Newest numbered release, newest build. The mirrors redirect, hence curl -L.
+# The image ships as a squashfs, not a tarball.
+Download-Rootfs-Cmd = '''
+base=https://images.linuxcontainers.org/images/nixos
+rel=$(curl -sL $base/ | grep -oE '[0-9]+\.[0-9]+' | sort -uV | tail -n 1)
+ts=$(curl -sL $base/$rel/amd64/default/ | grep -oE '[0-9]{8}_[0-9]{2}%3A[0-9]{2}' | sort -u | tail -n 1)
+echo "Downloading NixOS $rel ($ts)..."
+curl -L -o nixos-rootfs.squashfs "$base/$rel/amd64/default/$ts/rootfs.squashfs"
+unsquashfs -d ./rootfs nixos-rootfs.squashfs
+rm nixos-rootfs.squashfs
+
+# The image is a minimal first-boot rootfs: only /nix, /sbin/init and mount
+# stubs exist — NixOS activation creates /etc, /bin etc. at boot. Scaffold
+# what the build chroot needs (mkmelinux runs `chroot ./rootfs bash`).
+mkdir -p ./rootfs/bin ./rootfs/etc/nixos ./rootfs/etc/nix ./rootfs/etc/modprobe.d \
+         ./rootfs/root ./rootfs/tmp ./rootfs/run ./rootfs/var ./rootfs/usr/local/bin \
+         ./rootfs/boot ./rootfs/mnt
+chmod 1777 ./rootfs/tmp
+
+bashbin=$(ls -d ./rootfs/nix/store/*-bash-*/bin/bash 2>/dev/null | head -n 1)
+ln -sf "${bashbin#./rootfs}" ./rootfs/bin/bash
+ln -sf "${bashbin#./rootfs}" ./rootfs/bin/sh
+
+# Minimal identity files so nix and friends can resolve uid 0; activation
+# replaces these at boot.
+printf 'root:x:0:0:root:/root:/bin/sh\n' > ./rootfs/etc/passwd
+printf 'root:x:0:\n' > ./rootfs/etc/group
+
+# The build chroot has no user namespaces (no sandbox) and no nixbld users.
+cat > ./rootfs/etc/nix/nix.conf << 'NIXCONF_EOF'
+sandbox = false
+build-users-group =
+NIXCONF_EOF
+'''
+
+# /etc/resolv.conf may be a dangling symlink into /run — replace it with a
+# real file we can bind over.
+Setup-Chroot-Cmd = '''
+mount --bind ./rootfs ./rootfs
+mount -t proc none ./rootfs/proc
+mount --bind /sys ./rootfs/sys
+mount --bind /dev ./rootfs/dev
+mount --bind /dev/pts ./rootfs/dev/pts
+rm -f ./rootfs/etc/resolv.conf
+touch ./rootfs/etc/resolv.conf
+mount --bind /etc/resolv.conf ./rootfs/etc/resolv.conf
+'''
+
+Exit-Chroot-Cmd = '''
+umount ./rootfs/etc/resolv.conf
+umount ./rootfs/dev/pts
+umount ./rootfs/dev
+umount ./rootfs/sys
+umount ./rootfs/proc
+umount ./rootfs
+'''
+
+ISO-Install-Base-Packages-Cmd = '''
+echo "Setting up NixOS..."
+
+# The chroot starts with an empty effective PATH (NixOS has no /usr/bin), so
+# even `cat` is unavailable until the system closure's sw/bin is found. Glob
+# expansion is a shell builtin — use it to bootstrap PATH without externals.
+for d in /nix/store/*-nixos-system-*/sw/bin; do [ -d "$d" ] && PATH="$d:$PATH"; done
+export PATH
+
+# Environment every nix command in this chroot needs. Saved to a file so the
+# later template steps (and user extrachrootsteps.sh) can source it.
+cat > /root/.mkmelinux-nix-env.sh << 'ENV_EOF'
+# Bootstrap PATH from the store with shell builtins only — the chroot has no
+# /usr/bin, and even readlink is unavailable until sw/bin is on PATH.
+for d in /nix/store/*-nixos-system-*/sw/bin; do [ -d "$d" ] && PATH="$d:$PATH"; done
+export PATH
+export HOME=/root USER=root NIX_REMOTE=
+# /run/current-system does not exist in the chroot; the baked-in system
+# closure behind /sbin/init provides nix, coreutils, kmod, etc.
+sysdir=$(readlink /sbin/init); sysdir=${sysdir%/init}
+export PATH="$sysdir/sw/bin:/nix/var/nix/profiles/system/sw/bin:/nix/var/nix/profiles/default/bin:$PATH"
+cert=$(ls /nix/store/*nss-cacert*/etc/ssl/certs/ca-bundle.crt 2>/dev/null | head -n 1)
+[ -n "$cert" ] && export NIX_SSL_CERT_FILE="$cert"
+chandir=""
+for d in /nix/var/nix/profiles/per-user/root/channels/*/; do
+    [ -e "${d}default.nix" ] && chandir="${d%/}" && break
+done
+export NIX_PATH="nixpkgs=${chandir}:nixos-config=/etc/nixos/mkmelinux-build.nix"
+ENV_EOF
+. /root/.mkmelinux-nix-env.sh
+
+# First-boot image: the nix database is shipped as a registration dump.
+if [ ! -e /nix/var/nix/db/db.sqlite ] && [ -f /nix-path-registration ]; then
+    echo "Loading nix store database..."
+    nix-store --load-db < /nix-path-registration
+fi
+
+# No channel is configured in the image. Use the channel matching the image's
+# release (parsed from the system closure name, e.g. nixos-lxc-26.05...),
+# falling back to unstable if that channel does not resolve.
+rel=$(basename "$sysdir" | grep -oE '[0-9]+\.[0-9]+' | head -n 1)
+nix-channel --list | grep -q . || nix-channel --add "https://nixos.org/channels/nixos-${rel:-unstable}" nixos
+if ! nix-channel --update; then
+    echo "Channel nixos-${rel} not available, falling back to nixos-unstable..."
+    nix-channel --remove nixos
+    nix-channel --add https://nixos.org/channels/nixos-unstable nixos
+    nix-channel --update
+fi
+. /root/.mkmelinux-nix-env.sh   # re-resolve NIX_PATH now that the channel is realized
+
+# Boot-critical packages, installed with nix-env -iA into root's profile.
+# This profile is a GC root, so user rebuilds of the system profile and even
+# nix-collect-garbage cannot remove them. busybox in nixpkgs has a low
+# meta.priority, so its applet symlinks never shadow coreutils/kmod.
+echo "Installing boot packages with nix-env..."
+nix-env -iA linuxPackages.kernel linuxPackages.kernel.modules pkgsStatic.busybox kmod xz zstd -f '<nixpkgs>'
+
+# Default user configuration. This file may be wholly replaced by any valid
+# NixOS configuration (via extracustomization/etc/nixos/) — the mkmelinux
+# boot glue is enforced separately by mkmelinux-base.nix, which the rebuild
+# helper merges in via the mkmelinux-build.nix wrapper.
+mkdir -p /etc/nixos
+cat > /etc/nixos/configuration.nix << 'NIXCFG_EOF'
+{ config, pkgs, lib, ... }:
+
+{
+  # Put your NixOS configuration here, e.g.:
+  #   environment.systemPackages = with pkgs; [ vim htop ];
+  # A commented starting point ships with mkmelinux at
+  # resources/nixos-configuration-template.nix.
+  #
+  # Defaults provided by mkmelinux (override them freely): DHCP networking,
+  # root autologin on tty1, empty root password, firewall off.
+  #
+  # Avoid enabling a display manager: the kernel lives outside the system
+  # profile, so udev cannot autoload DRM/input modules, and a failing
+  # display-manager can leave the boot stuck with no login prompt.
+
+  system.stateVersion = lib.trivial.release;
+}
+NIXCFG_EOF
+
+# Rebuild helper: merges /etc/nixos/configuration.nix with the mkmelinux boot
+# glue and points the system profile at the result. We cannot use
+# `nixos-rebuild switch` in a chroot (no running systemd), so this does the
+# equivalent by hand. Activation runs at boot via stage-2 init.
+# The glue modules are rewritten on every run so no user configuration.nix
+# (or stray extracustomization file) can break the live-boot contract.
+mkdir -p /usr/local/bin
+cat > /usr/local/bin/nixos-mkmelinux-rebuild << 'REBUILD_EOF'
+#!/bin/sh
+set -e
+. /root/.mkmelinux-nix-env.sh
+
+mkdir -p /etc/nixos
+cat > /etc/nixos/mkmelinux-base.nix << 'BASE_EOF'
+# mkmelinux boot glue — regenerated by nixos-mkmelinux-rebuild, do not edit.
+{ config, pkgs, lib, ... }:
+
+{
+  # Kernel, initramfs and bootloader are managed by mkmelinux, not NixOS.
+  # Forced, so no configuration.nix can produce an unbootable image.
+  # Do NOT switch to boot.isContainer — it also disables udev and the
+  # virtual-console gettys, leaving the booted system with no login prompt.
+  boot.kernel.enable = lib.mkForce false;
+  boot.initrd.enable = lib.mkForce false;
+  boot.loader.grub.enable = lib.mkForce false;
+  boot.loader.systemd-boot.enable = lib.mkForce false;
+  # Root is the live overlay assembled by the mkmelinux initramfs; this stub
+  # only satisfies the fileSystems."/" assertion.
+  fileSystems."/" = lib.mkForce {
+    device = "overlay";
+    fsType = "overlay";
+    options = [ "noauto" ];
+  };
+
+  # Usability defaults — mkDefault, so configuration.nix can override them.
+  networking.hostName = lib.mkDefault "mkmelinux-nixos";
+  networking.useDHCP = lib.mkDefault true;
+  # In-guest kernel module autoloading is unavailable (the kernel lives
+  # outside the system profile); nf_tables cannot load at runtime.
+  networking.firewall.enable = lib.mkDefault false;
+  services.getty.autologinUser = lib.mkDefault "root";
+  users.users.root.initialHashedPassword = lib.mkDefault "";
+  system.stateVersion = lib.mkDefault lib.trivial.release;
+}
+BASE_EOF
+
+cat > /etc/nixos/mkmelinux-build.nix << 'WRAP_EOF'
+# Build entry point (NIX_PATH nixos-config) — regenerated by
+# nixos-mkmelinux-rebuild, do not edit. Put your configuration in
+# configuration.nix; any valid NixOS configuration works there.
+{ ... }:
+
+{
+  imports = [ ./configuration.nix ./mkmelinux-base.nix ];
+}
+WRAP_EOF
+
+echo "nixos-mkmelinux-rebuild: building system from /etc/nixos/configuration.nix..."
+sys=$(nix-build '<nixpkgs/nixos>' -A system --no-out-link)
+nix-env -p /nix/var/nix/profiles/system --set "$sys"
+# Keep the /sbin/init fallback in sync — the container image ships it pointing
+# at the stock LXC closure (no VT gettys), which must never boot.
+ln -sfn "$sys/init" /sbin/init
+echo "nixos-mkmelinux-rebuild: system profile set to $sys"
+REBUILD_EOF
+chmod +x /usr/local/bin/nixos-mkmelinux-rebuild
+
+/usr/local/bin/nixos-mkmelinux-rebuild
+'''
+
+# Runs after extrachrootsteps.sh and extracustomization are in place. If the
+# user dropped in their own configuration.nix, this applies it — and then
+# re-asserts the boot packages with nix-env -iA so no user configuration can
+# produce an unbootable image.
+Post-ExtraChrootSteps-Cmd = '''
+. /root/.mkmelinux-nix-env.sh
+
+/usr/local/bin/nixos-mkmelinux-rebuild
+
+echo "Re-asserting boot packages with nix-env..."
+nix-env -iA linuxPackages.kernel linuxPackages.kernel.modules pkgsStatic.busybox kmod xz zstd -f '<nixpkgs>'
+'''
+
+# No mkinitcpio on NixOS — build the live initramfs by hand from the static
+# busybox. It mirrors what the mklive mkinitcpio hook does for Arch: find the
+# boot medium, mount the squashfs, overlay a tmpfs, switch root. The handoff
+# target is NixOS's stage-2 init, which runs activation and execs systemd.
+Regenerate-Initramfs-Cmd = '''
+set -e
+. /root/.mkmelinux-nix-env.sh
+
+# Drop old container-image system generations before packaging.
+# Everything we need stays rooted: boot packages in root's nix-env profile,
+# the built system in the system profile.
+nix-collect-garbage -d || true
+
+KERNEL_OUT=$(nix-build '<nixpkgs>' -A linuxPackages.kernel --no-out-link)
+BB_OUT=$(nix-build '<nixpkgs>' -A pkgsStatic.busybox --no-out-link)
+# Modules are a separate kernel output in current nixpkgs; older releases
+# keep them inside $out.
+MODULES_OUT=$(nix-build '<nixpkgs>' -A linuxPackages.kernel.modules --no-out-link 2>/dev/null) \
+    || MODULES_OUT="$KERNEL_OUT"
+KVER=$(ls "$MODULES_OUT/lib/modules" | head -n 1)
+[ -n "$KVER" ] || { echo "ERROR: no kernel modules found in $MODULES_OUT"; exit 1; }
+MODSRC="$MODULES_OUT/lib/modules/$KVER"
+BB="$BB_OUT/bin/busybox"
+
+mkdir -p /boot
+cp "$KERNEL_OUT/bzImage" /boot/vmlinuz-nixos
+
+# Module path for the running live system (kmod's default search path), so
+# `modprobe` works after boot even though the kernel is not in the system
+# profile.
+mkdir -p /lib
+ln -sfn "$MODULES_OUT/lib/modules" /lib/modules
+
+WORK=/tmp/mkmelinux-initramfs
+rm -rf "$WORK"
+mkdir -p "$WORK/bin" "$WORK/dev" "$WORK/proc" "$WORK/sys" "$WORK/run" \
+         "$WORK/mnt/medium" "$WORK/mnt/rootfs" "$WORK/mnt/overlay" "$WORK/mnt/root" \
+         "$WORK/lib/modules/$KVER"
+
+cp "$BB" "$WORK/bin/busybox"
+for a in sh mount umount switch_root modprobe sleep echo cat ls mkdir ln readlink dirname; do
+    ln -s busybox "$WORK/bin/$a"
+done
+
+# Storage, filesystem and wired-network modules. NixOS compresses modules
+# (.ko.xz / .ko.zst); busybox modprobe cannot decompress, so unpack them and
+# regenerate modules.dep with depmod for the trimmed tree.
+for sub in kernel/fs/squashfs kernel/fs/overlayfs kernel/fs/isofs \
+           kernel/drivers/cdrom kernel/drivers/scsi kernel/drivers/ata \
+           kernel/drivers/block kernel/drivers/nvme kernel/drivers/usb \
+           kernel/drivers/virtio kernel/drivers/mmc \
+           kernel/drivers/net/ethernet kernel/drivers/net/phy \
+           kernel/drivers/gpu kernel/drivers/hid kernel/drivers/input \
+           kernel/lib kernel/crypto kernel/arch; do
+    if [ -e "$MODSRC/$sub" ]; then
+        mkdir -p "$WORK/lib/modules/$KVER/$(dirname "$sub")"
+        cp -a --no-preserve=mode "$MODSRC/$sub" "$WORK/lib/modules/$KVER/$(dirname "$sub")/"
+    fi
+done
+# The huge GPU drivers need firmware blobs we do not ship — drop them.
+# VM (bochs/virtio/qxl/vmware) and Intel graphics remain supported.
+rm -rf "$WORK/lib/modules/$KVER/kernel/drivers/gpu/drm/amd" \
+       "$WORK/lib/modules/$KVER/kernel/drivers/gpu/drm/nouveau" \
+       "$WORK/lib/modules/$KVER/kernel/drivers/gpu/drm/radeon" \
+       "$WORK/lib/modules/$KVER/kernel/drivers/gpu/drm/xe"
+cp --no-preserve=mode "$MODSRC"/modules.* "$WORK/lib/modules/$KVER/" 2>/dev/null || true
+find "$WORK/lib/modules" -name '*.ko.xz'  -exec xz -d {} +
+find "$WORK/lib/modules" -name '*.ko.zst' -exec zstd -q -d --rm {} +
+depmod -b "$WORK" "$KVER"
+
+cat > "$WORK/init" << 'INIT_EOF'
+#!/bin/sh
+export PATH=/bin
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+# Storage, display, input and common wired NICs. The booted system cannot
+# rely on udev module autoloading (the kernel lives outside the system
+# profile), so everything the live session needs is loaded here.
+for m in loop squashfs overlay isofs cdrom sr_mod sd_mod \
+         ahci ata_piix ata_generic nvme \
+         usb-storage uas xhci-pci ehci-pci uhci-hcd ohci-pci \
+         virtio_pci virtio_blk virtio_scsi virtio_net \
+         sdhci-pci mmc_block e1000 e1000e r8169 igb igc tg3 \
+         bochs bochs_drm virtio_gpu qxl vmwgfx cirrus i915 ast mgag200 \
+         i8042 atkbd psmouse usbhid hid_generic; do
+    modprobe "$m" 2>/dev/null
+done
+
+img=/live/rootfs.squashfs
+found=""
+tries=0
+while [ -z "$found" ] && [ "$tries" -lt 30 ]; do
+    for dev in /dev/sr[0-9] /dev/sd[a-z] /dev/sd[a-z][0-9] /dev/vd[a-z] \
+               /dev/nvme[0-9]n[0-9] /dev/nvme[0-9]n[0-9]p[0-9] /dev/mmcblk[0-9] /dev/mmcblk[0-9]p[0-9]; do
+        [ -b "$dev" ] || continue
+        mount -r "$dev" /mnt/medium 2>/dev/null || continue
+        if [ -f "/mnt/medium$img" ]; then
+            echo "mklive: found squashfs on $dev"
+            found="$dev"
+            break
+        fi
+        umount /mnt/medium 2>/dev/null
+    done
+    if [ -z "$found" ]; then
+        tries=$((tries + 1))
+        echo "mklive: boot medium not found yet (attempt $tries/30)"
+        sleep 1
+    fi
+done
+
+if [ -z "$found" ]; then
+    echo "mklive: ERROR: boot medium not found, dropping to shell"
+    exec sh
+fi
+
+mount -r -t squashfs "/mnt/medium$img" /mnt/rootfs
+mount -t tmpfs tmpfs /mnt/overlay
+mkdir -p /mnt/overlay/upper /mnt/overlay/work
+mount -t overlay overlay \
+    -o lowerdir=/mnt/rootfs,upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work \
+    /mnt/root
+
+# Keep the live mounts alive across switch_root. Pre-mounting /run means
+# NixOS stage-2 sees it already mounted and leaves it alone.
+mount -t tmpfs tmpfs /mnt/root/run
+mkdir -p /mnt/root/run/mklive/medium /mnt/root/run/mklive/rootfs /mnt/root/run/mklive/overlay
+mount --move /mnt/medium  /mnt/root/run/mklive/medium
+mount --move /mnt/rootfs  /mnt/root/run/mklive/rootfs
+mount --move /mnt/overlay /mnt/root/run/mklive/overlay
+
+# Hand over to the system profile's init. The profile is a chain of
+# symlinks with ABSOLUTE targets (/nix/...), which cannot be resolved from
+# the initramfs — and the symlinks sit MID-PATH (profiles/system/init: the
+# "system" component is the link), so even lstat of the full path fails and
+# we would silently boot the stale /sbin/init baked into the container
+# image. Canonicalize component by component under the new-root prefix.
+resolve() {
+    # resolve <path-relative-to-newroot> -> echoes resolved path or fails
+    res=""; rest="${1#/}"; n=0
+    while [ -n "$rest" ]; do
+        n=$((n + 1)); [ "$n" -gt 100 ] && return 1
+        comp="${rest%%/*}"
+        case "$rest" in */*) rest="${rest#*/}" ;; *) rest="" ;; esac
+        case "$comp" in "" | .) continue ;; ..) res="${res%/*}"; continue ;; esac
+        if [ -L "/mnt/root$res/$comp" ]; then
+            t=$(readlink "/mnt/root$res/$comp")
+            case "$t" in
+                /*) res=""; rest="${t#/}${rest:+/$rest}" ;;
+                *)  rest="$t${rest:+/$rest}" ;;
+            esac
+        else
+            res="$res/$comp"
+        fi
+    done
+    [ -n "$res" ] && [ -e "/mnt/root$res" ] || return 1
+    echo "$res"
+}
+
+for i in /nix/var/nix/profiles/system/init /sbin/init /init; do
+    target=$(resolve "$i") || continue
+    echo "mklive: switching root, handing over to $i ($target)"
+    exec switch_root /mnt/root "$target"
+done
+echo "mklive: ERROR: no init found in new root, dropping to shell"
+exec sh
+INIT_EOF
+chmod +x "$WORK/init"
+
+echo "Packing initramfs..."
+(cd "$WORK" && "$BB" find . | "$BB" cpio -o -H newc 2>/dev/null | "$BB" gzip -9) \
+    > /boot/initramfs-nixos.img
+rm -rf "$WORK"
+echo "Initramfs ready: /boot/initramfs-nixos.img"
+'''
+
+Vmlinuz-Name = "vmlinuz-nixos"
+Initramfs-Name = "initramfs-nixos.img"

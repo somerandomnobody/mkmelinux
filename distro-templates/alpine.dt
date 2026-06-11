@@ -1,0 +1,236 @@
+[DistroInfo]
+DistroName = "Alpine Linux"
+Arch = "x64"
+Description = "Alpine Linux for mkmelinux. Small, musl/busybox based, OpenRC init."
+Supporting = ["ISO", "HARDDISK"]
+
+[ContainerConfig]
+Packages = ["curl"]
+
+# ── How this template works ───────────────────────────────────────────────────
+# The base rootfs is the official Alpine minirootfs tarball (busybox + apk,
+# no kernel). Alpine has no bash and no systemd:
+#
+#   * mkmelinux runs every chroot step with `chroot ./rootfs bash`, so
+#     Setup-Chroot-Cmd installs bash with apk from outside the chroot before
+#     any chroot step runs.
+#   * Init is OpenRC. The minirootfs ships empty runlevels, so the install
+#     steps wire up the standard sysinit/boot/shutdown services and configure
+#     root autologin on tty1 via /etc/inittab (the builder's default systemd
+#     autologin step does nothing on Alpine).
+#   * ISO builds use Alpine's own mkinitfs, but with a custom init script
+#     (mkinitfs -i) that finds the boot medium, mounts the squashfs plus a
+#     tmpfs overlay, and switch_roots into OpenRC — the same live-boot scheme
+#     as the Arch mklive hook. The storage modules it needs are declared as a
+#     custom mkinitfs feature (/etc/mkinitfs/features.d/mklive.modules).
+#   * HARDDISK builds keep the stock Alpine initramfs, whose nlplug-findfs
+#     handles root=UUID from the GRUB config.
+#
+# linux-firmware-none satisfies linux-lts's firmware dependency without
+# pulling the ~700MB linux-firmware package; hardware needing firmware blobs
+# (most WiFi, AMD/Nvidia GPUs) is out of scope for the default image.
+
+[DistroConfig]
+
+# latest-stable always points at the newest release branch; the yaml lists the
+# exact minirootfs tarball name for that branch.
+Download-Rootfs-Cmd = '''
+base=https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64
+file=$(curl -s $base/latest-releases.yaml | grep -oE 'alpine-minirootfs-[0-9.]+-x86_64\.tar\.gz' | head -n 1)
+[ -n "$file" ] || { echo "ERROR: could not determine latest Alpine minirootfs"; exit 1; }
+echo "Downloading $file..."
+curl -O "$base/$file"
+mkdir rootfs
+tar -xzf "$file" -C ./rootfs
+rm "$file"
+'''
+
+# The minirootfs has no /etc/resolv.conf — create one to bind over. bash must
+# be installed from outside the chroot (with busybox apk) because every later
+# template step runs `chroot ./rootfs bash`.
+Setup-Chroot-Cmd = '''
+mount --bind ./rootfs ./rootfs
+mount -t proc none ./rootfs/proc
+mount --bind /sys ./rootfs/sys
+mount --bind /dev ./rootfs/dev
+mount --bind /dev/pts ./rootfs/dev/pts
+rm -f ./rootfs/etc/resolv.conf
+touch ./rootfs/etc/resolv.conf
+mount --bind /etc/resolv.conf ./rootfs/etc/resolv.conf
+chroot ./rootfs /sbin/apk add --no-cache bash
+'''
+
+Exit-Chroot-Cmd = '''
+umount ./rootfs/etc/resolv.conf
+umount ./rootfs/dev/pts
+umount ./rootfs/dev
+umount ./rootfs/sys
+umount ./rootfs/proc
+umount ./rootfs
+'''
+
+# alpine-base = baselayout + busybox + openrc + alpine-conf.
+# busybox-mdev-openrc provides the mdev service (device manager + module
+# autoloading via hwdrivers). dhcpcd's OpenRC service DHCPs all interfaces.
+ISO-Install-Base-Packages-Cmd = '''
+echo "Setting up Alpine Linux..."
+apk add --no-cache alpine-base linux-firmware-none linux-lts mkinitfs \
+    busybox-mdev-openrc dhcpcd
+
+# The minirootfs ships empty OpenRC runlevels — wire up the standard set.
+rc-update add devfs sysinit
+rc-update add dmesg sysinit
+rc-update add mdev sysinit
+rc-update add hwdrivers sysinit
+rc-update add modules boot
+rc-update add sysctl boot
+rc-update add hostname boot
+rc-update add bootmisc boot
+rc-update add syslog boot
+rc-update add dhcpcd boot
+rc-update add mount-ro shutdown
+rc-update add killprocs shutdown
+
+# Root autologin on tty1. Alpine's root account has no password by default;
+# busybox `login -f` skips authentication entirely.
+sed -i 's#^tty1::respawn:.*#tty1::respawn:/bin/login -f root#' /etc/inittab
+'''
+
+# Same base as ISO, plus GRUB (the builder runs grub-mkconfig/grub-install in
+# the chroot) and e2fsprogs so the installed system can fsck its ext4 root.
+HARDDISK-Install-Base-Packages-Cmd = '''
+echo "Setting up Alpine Linux..."
+apk add --no-cache alpine-base linux-firmware-none linux-lts mkinitfs \
+    busybox-mdev-openrc dhcpcd grub grub-efi efibootmgr e2fsprogs
+
+rc-update add devfs sysinit
+rc-update add dmesg sysinit
+rc-update add mdev sysinit
+rc-update add hwdrivers sysinit
+rc-update add modules boot
+rc-update add sysctl boot
+rc-update add hostname boot
+rc-update add bootmisc boot
+rc-update add syslog boot
+rc-update add dhcpcd boot
+# Disk boots need fsck and the rw remount of / from fstab.
+rc-update add fsck boot
+rc-update add root boot
+rc-update add localmount boot
+rc-update add mount-ro shutdown
+rc-update add killprocs shutdown
+rc-update add savecache shutdown
+
+sed -i 's#^tty1::respawn:.*#tty1::respawn:/bin/login -f root#' /etc/inittab
+'''
+
+# Install the live-boot init and its module set for mkinitfs. Only ISO builds
+# get this file — Regenerate-Initramfs-Cmd keys off its presence.
+ISO-Pre-Initramfs-Cmd = '''
+mkdir -p /etc/mkinitfs/features.d /usr/share/mkinitfs
+
+# Storage + filesystem modules the live initramfs needs. mkinitfs feature
+# files take directories (recursed) or globs relative to /lib/modules/<ver>.
+cat > /etc/mkinitfs/features.d/mklive.modules << 'FEATURE_EOF'
+kernel/fs/squashfs
+kernel/fs/overlayfs
+kernel/fs/isofs
+kernel/drivers/block/loop.ko*
+kernel/drivers/cdrom
+kernel/drivers/scsi
+kernel/drivers/ata
+kernel/drivers/nvme
+kernel/drivers/usb/host
+kernel/drivers/usb/storage
+kernel/drivers/virtio
+kernel/drivers/block/virtio_blk.ko*
+kernel/drivers/mmc
+FEATURE_EOF
+
+# Live init: mirrors the Arch mklive hook — scan block devices for the
+# squashfs, mount it read-only under a tmpfs overlay, switch_root to OpenRC.
+cat > /usr/share/mkinitfs/initramfs-init-mklive << 'INIT_EOF'
+#!/bin/sh
+/bin/busybox mkdir -p /usr/bin /usr/sbin /proc /sys /dev /tmp \
+    /mnt/medium /mnt/rootfs /mnt/overlay /mnt/root
+/bin/busybox --install -s
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+# Alpine ships modules gzipped (.ko.gz); its busybox modprobe handles that.
+for m in loop squashfs overlay isofs cdrom sr_mod sd_mod \
+         ahci ata_piix ata_generic nvme \
+         usb-storage uas xhci-pci ehci-pci uhci-hcd ohci-pci \
+         virtio_pci virtio_blk virtio_scsi \
+         sdhci-pci mmc_block; do
+    modprobe "$m" 2>/dev/null
+done
+
+img=/live/rootfs.squashfs
+found=""
+tries=0
+while [ -z "$found" ] && [ "$tries" -lt 30 ]; do
+    for dev in /dev/sr[0-9] /dev/sd[a-z] /dev/sd[a-z][0-9] /dev/vd[a-z] \
+               /dev/nvme[0-9]n[0-9] /dev/nvme[0-9]n[0-9]p[0-9] \
+               /dev/mmcblk[0-9] /dev/mmcblk[0-9]p[0-9]; do
+        [ -b "$dev" ] || continue
+        mount -r "$dev" /mnt/medium 2>/dev/null || continue
+        if [ -f "/mnt/medium$img" ]; then
+            echo "mklive: found squashfs on $dev"
+            found="$dev"
+            break
+        fi
+        umount /mnt/medium 2>/dev/null
+    done
+    if [ -z "$found" ]; then
+        tries=$((tries + 1))
+        echo "mklive: boot medium not found yet (attempt $tries/30)"
+        sleep 1
+    fi
+done
+
+if [ -z "$found" ]; then
+    echo "mklive: ERROR: boot medium not found, dropping to shell"
+    exec sh
+fi
+
+mount -r -t squashfs "/mnt/medium$img" /mnt/rootfs
+mount -t tmpfs tmpfs /mnt/overlay
+mkdir -p /mnt/overlay/upper /mnt/overlay/work
+mount -t overlay overlay \
+    -o lowerdir=/mnt/rootfs,upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work \
+    /mnt/root
+
+# Keep the live mounts alive across switch_root. OpenRC only mounts a tmpfs
+# on /run if nothing is mounted there yet, so pre-mounting it preserves them
+# (and /run/mklive/rootfs marks the system as a live boot for user scripts).
+mount -t tmpfs tmpfs /mnt/root/run
+mkdir -p /mnt/root/run/mklive/medium /mnt/root/run/mklive/rootfs /mnt/root/run/mklive/overlay
+mount --move /mnt/medium  /mnt/root/run/mklive/medium
+mount --move /mnt/rootfs  /mnt/root/run/mklive/rootfs
+mount --move /mnt/overlay /mnt/root/run/mklive/overlay
+
+umount /sys
+umount /proc
+exec switch_root /mnt/root /sbin/init
+INIT_EOF
+chmod +x /usr/share/mkinitfs/initramfs-init-mklive
+'''
+
+# ISO builds (custom init present): pack the live initramfs with mkinitfs -i.
+# HARDDISK builds: stock Alpine initramfs, which resolves root=UUID itself.
+Regenerate-Initramfs-Cmd = '''
+KVER=$(ls /lib/modules | head -n 1)
+if [ -f /usr/share/mkinitfs/initramfs-init-mklive ]; then
+    mkinitfs -F "base mklive" -i /usr/share/mkinitfs/initramfs-init-mklive \
+        -o /boot/initramfs-lts "$KVER"
+else
+    mkinitfs -o /boot/initramfs-lts "$KVER"
+fi
+'''
+
+# Alpine's linux-lts package names (note: no .img suffix on the initramfs).
+Vmlinuz-Name = "vmlinuz-lts"
+Initramfs-Name = "initramfs-lts"

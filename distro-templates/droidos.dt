@@ -51,7 +51,8 @@ echo "Setting up DroidOS..."
 pacman -Sy --noconfirm linux-zen grub squashfs-tools efibootmgr gptfdisk rsync dhcpcd busybox \
     weston xorg-xwayland networkmanager linux-firmware libdisplay-info lxc dnsmasq nftables \
     pipewire pipewire-pulse wireplumber git python-requests python-lxml \
-    mesa vulkan-intel intel-media-driver libva-mesa-driver dialog
+    mesa vulkan-intel intel-media-driver libva-mesa-driver dialog \
+    dosfstools e2fsprogs
 
 # archlinuxcn repo provides pre-built waydroid (avoids AUR/makepkg in chroot)
 printf '\n[archlinuxcn]\nServer = https://repo.archlinuxcn.org/$arch\n' >> /etc/pacman.conf
@@ -379,6 +380,11 @@ chmod +x /usr/local/bin/droidos-weston
 
 cat > /root/.bash_profile << 'EOF'
 if [[ $(tty) == /dev/tty1 ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+  # Stop the initramfs boot-screen spinner just before Weston takes the display.
+  if [[ -f /run/droidos-spinner.pid ]]; then
+    kill "$(cat /run/droidos-spinner.pid)" 2>/dev/null || true
+    rm -f /run/droidos-spinner.pid
+  fi
   exec droidos-weston
 fi
 EOF
@@ -429,12 +435,39 @@ mkdir -p /etc/droidos
 echo "DROIDOS_TYPE=${DROIDOS_TYPE:-MOBILE}" > /etc/droidos/config
 
 echo "[droidos-setup] Downloading Android images..."
+
+# waydroid's init verifies that binder device nodes exist (setupBinderNodes
+# raises OSError when they are missing) — but the check is a plain existence
+# test, and the modprobe it tries first targets the HOST kernel, which inside
+# the build container usually has no binder_linux. Stub the nodes for the
+# duration of init: /dev here is the bind-mounted container /dev, so the
+# stubs never end up in the image. The names recorded in waydroid.cfg
+# (binder/vndbinder/hwbinder) match what droidos-binder allocates via
+# binderfs on every boot.
+_stubbed=""
+for _n in binder vndbinder hwbinder; do
+    if [ ! -e "/dev/$_n" ]; then
+        touch "/dev/$_n"
+        _stubbed="$_stubbed /dev/$_n"
+    fi
+done
+
+_init_rc=0
 if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
     echo "[droidos-setup] Android TV build selected."
     waydroid init -c https://ota.supechicken666.dev/system \
-                  -v https://ota.supechicken666.dev/vendor -s GAPPS
+                  -v https://ota.supechicken666.dev/vendor -s GAPPS || _init_rc=$?
 else
-    waydroid init -s VANILLA
+    waydroid init -s VANILLA || _init_rc=$?
+fi
+[ -z "$_stubbed" ] || rm -f $_stubbed
+
+# A failed init must fail the build — otherwise the ISO boots into
+# "WayDroid is not initialized" with no Android in it at all.
+if [ "$_init_rc" -ne 0 ] || [ ! -f /var/lib/waydroid/waydroid.cfg ] \
+    || [ ! -f /var/lib/waydroid/images/system.img ]; then
+    echo "[droidos-setup] ERROR: waydroid init failed (rc=${_init_rc}) — no Android images." >&2
+    exit 1
 fi
 echo "[droidos-setup] Android images ready."
 
@@ -444,12 +477,25 @@ echo 'persist.waydroid.fake_wifi=*' >> /var/lib/waydroid/waydroid_base.prop
 
 git clone https://github.com/casualsnek/waydroid_script /opt/waydroid_script 2>/dev/null || true
 cd /opt/waydroid_script
+# waydroid_script's dependencies (InquirerPy, tqdm) are not packaged by Arch —
+# give it a private venv instead of polluting the system python.
+python3 -m venv venv
+./venv/bin/pip install --quiet -r requirements.txt \
+    || echo "[droidos-setup] WARNING: waydroid_script deps failed to install."
+# waydroid_script derives its download cache from $USER (the chroot has none;
+# XDG_CACHE_HOME wins when set). Keep the cache in a throwaway dir — anything
+# left behind in the rootfs would be shipped inside the image.
+export XDG_CACHE_HOME=/tmp/waydroid-script-cache
+export USER=root
+# timeout: waydroid_script streams downloads with no socket timeout — a
+# dropped connection otherwise hangs the build forever.
 echo "[droidos-setup] Installing libhoudini (ARM support)..."
-python3 main.py install libhoudini && echo "[droidos-setup] libhoudini installed." \
+timeout 30m ./venv/bin/python main.py install libhoudini && echo "[droidos-setup] libhoudini installed." \
     || echo "[droidos-setup] WARNING: libhoudini install failed."
 echo "[droidos-setup] Installing GApps..."
-python3 main.py install gapps && echo "[droidos-setup] GApps installed." \
+timeout 30m ./venv/bin/python main.py install gapps && echo "[droidos-setup] GApps installed." \
     || echo "[droidos-setup] WARNING: GApps install failed."
+rm -rf /tmp/waydroid-script-cache
 '''
 
 # Packages needed for a UEFI virtual-machine disk image.
@@ -498,6 +544,8 @@ cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << 'GETTY_EOF'
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 GETTY_EOF
+
+sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 rd.udev.log_level=3 systemd.show_status=no vt.global_cursor_default=0"/' /etc/default/grub
 
 cat > /usr/local/bin/droidos-binder << 'BINDER_EOF'
 #!/bin/bash
@@ -777,6 +825,11 @@ chmod +x /usr/local/bin/droidos-weston
 
 cat > /root/.bash_profile << 'EOF'
 if [[ $(tty) == /dev/tty1 ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+  # Stop the initramfs boot-screen spinner just before Weston takes the display.
+  if [[ -f /run/droidos-spinner.pid ]]; then
+    kill "$(cat /run/droidos-spinner.pid)" 2>/dev/null || true
+    rm -f /run/droidos-spinner.pid
+  fi
   exec droidos-weston
 fi
 EOF
@@ -826,12 +879,39 @@ mkdir -p /etc/droidos
 echo "DROIDOS_TYPE=${DROIDOS_TYPE:-MOBILE}" > /etc/droidos/config
 
 echo "[droidos-setup] Downloading Android images..."
+
+# waydroid's init verifies that binder device nodes exist (setupBinderNodes
+# raises OSError when they are missing) — but the check is a plain existence
+# test, and the modprobe it tries first targets the HOST kernel, which inside
+# the build container usually has no binder_linux. Stub the nodes for the
+# duration of init: /dev here is the bind-mounted container /dev, so the
+# stubs never end up in the image. The names recorded in waydroid.cfg
+# (binder/vndbinder/hwbinder) match what droidos-binder allocates via
+# binderfs on every boot.
+_stubbed=""
+for _n in binder vndbinder hwbinder; do
+    if [ ! -e "/dev/$_n" ]; then
+        touch "/dev/$_n"
+        _stubbed="$_stubbed /dev/$_n"
+    fi
+done
+
+_init_rc=0
 if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
     echo "[droidos-setup] Android TV build selected."
     waydroid init -c https://ota.supechicken666.dev/system \
-                  -v https://ota.supechicken666.dev/vendor -s GAPPS
+                  -v https://ota.supechicken666.dev/vendor -s GAPPS || _init_rc=$?
 else
-    waydroid init -s VANILLA
+    waydroid init -s VANILLA || _init_rc=$?
+fi
+[ -z "$_stubbed" ] || rm -f $_stubbed
+
+# A failed init must fail the build — otherwise the ISO boots into
+# "WayDroid is not initialized" with no Android in it at all.
+if [ "$_init_rc" -ne 0 ] || [ ! -f /var/lib/waydroid/waydroid.cfg ] \
+    || [ ! -f /var/lib/waydroid/images/system.img ]; then
+    echo "[droidos-setup] ERROR: waydroid init failed (rc=${_init_rc}) — no Android images." >&2
+    exit 1
 fi
 echo "[droidos-setup] Android images ready."
 
@@ -841,12 +921,25 @@ echo 'persist.waydroid.fake_wifi=*' >> /var/lib/waydroid/waydroid_base.prop
 
 git clone https://github.com/casualsnek/waydroid_script /opt/waydroid_script 2>/dev/null || true
 cd /opt/waydroid_script
+# waydroid_script's dependencies (InquirerPy, tqdm) are not packaged by Arch —
+# give it a private venv instead of polluting the system python.
+python3 -m venv venv
+./venv/bin/pip install --quiet -r requirements.txt \
+    || echo "[droidos-setup] WARNING: waydroid_script deps failed to install."
+# waydroid_script derives its download cache from $USER (the chroot has none;
+# XDG_CACHE_HOME wins when set). Keep the cache in a throwaway dir — anything
+# left behind in the rootfs would be shipped inside the image.
+export XDG_CACHE_HOME=/tmp/waydroid-script-cache
+export USER=root
+# timeout: waydroid_script streams downloads with no socket timeout — a
+# dropped connection otherwise hangs the build forever.
 echo "[droidos-setup] Installing libhoudini (ARM support)..."
-python3 main.py install libhoudini && echo "[droidos-setup] libhoudini installed." \
+timeout 30m ./venv/bin/python main.py install libhoudini && echo "[droidos-setup] libhoudini installed." \
     || echo "[droidos-setup] WARNING: libhoudini install failed."
 echo "[droidos-setup] Installing GApps..."
-python3 main.py install gapps && echo "[droidos-setup] GApps installed." \
+timeout 30m ./venv/bin/python main.py install gapps && echo "[droidos-setup] GApps installed." \
     || echo "[droidos-setup] WARNING: GApps install failed."
+rm -rf /tmp/waydroid-script-cache
 '''
 
 # Runs after extrachrootsteps.sh and extracustomization files are in place.
@@ -856,6 +949,54 @@ python3 main.py install gapps && echo "[droidos-setup] GApps installed." \
 # Android scans /system/app/ on first boot and installs everything it finds.
 Post-ExtraChrootSteps-Cmd = '''
 mkdir -p /var/lib/droidos/apks
+
+# systemd-firstboot prints "Welcome to your new installation of Arch Linux!"
+# and prompts for timezone on the console whenever /etc/machine-id is empty
+# (every live boot), drawing over the DroidOS boot screen. Mask it and
+# pre-seed the answers it would have asked for.
+systemctl mask systemd-firstboot.service
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
+locale-gen 2>/dev/null || true
+echo 'LANG=en_US.UTF-8' > /etc/locale.conf
+
+# DroidOS boot screen — an initramfs (mkinitcpio) earlyhook, NOT a systemd
+# service, so it appears within the first moments of boot instead of after
+# the tty is up. The spinner subshell survives switch_root (its busybox text
+# stays pinned in memory) and keeps redrawing tty1 — overwriting any console
+# output — until .bash_profile kills it via the pidfile right before Weston
+# starts. /run is moved into the real root by mkinitcpio's init, so the
+# pidfile written here is visible to the booted system.
+mkdir -p /etc/initcpio/hooks /etc/initcpio/install
+
+cat > /etc/initcpio/hooks/droidos-splash << 'SPLASH_HOOK_EOF'
+run_earlyhook() {
+    (
+        exec </dev/null >/dev/tty1 2>&1
+        trap 'printf "\033[?25h\033[2J\033[H"; exit 0' TERM
+        printf '\033[?25l'        # hide cursor
+        # Full clear + redraw each frame in a single write, so any stray
+        # console output is wiped within one frame.
+        while :; do
+            for c in '|' '/' '-' '\'; do
+                printf '\033[2J\033[10;37H\033[1;36mDroidOS\033[0m\033[12;40H\033[1;36m%s\033[0m' "$c"
+                sleep 0.2 2>/dev/null || sleep 1
+            done
+        done
+    ) &
+    echo $! > /run/droidos-spinner.pid
+}
+SPLASH_HOOK_EOF
+
+cat > /etc/initcpio/install/droidos-splash << 'SPLASH_INSTALL_EOF'
+build() {
+    add_runscript
+}
+
+help() {
+    echo "Draws the DroidOS boot screen on tty1 from early initramfs."
+}
+SPLASH_INSTALL_EOF
 
 cat > /usr/local/bin/droidos-install-apks << 'APKS_EOF'
 #!/bin/bash
@@ -925,11 +1066,18 @@ DISK_INFO="$(lsblk -d -n -o SIZE,MODEL "$DISK" | xargs)"
 dialog --title "DroidOS Installer" \
     --yesno "\nInstall DroidOS to $DISK ($DISK_INFO)?\n\nALL DATA ON THIS DISK WILL BE PERMANENTLY ERASED." 10 56 || exit 0
 
-# Partition naming: nvme/mmcblk use p1/p2, others use 1/2
-if [[ "$DISK" =~ nvme|mmcblk ]]; then
-    EFI="${DISK}p1"; ROOT="${DISK}p2"
+# Detect firmware — /sys/firmware/efi exists only on UEFI systems.
+if [ -d /sys/firmware/efi ]; then
+    BOOT_MODE=uefi
 else
-    EFI="${DISK}1";  ROOT="${DISK}2"
+    BOOT_MODE=bios
+fi
+
+# Partition naming: nvme/mmcblk use p1/p2/p3, others use 1/2/3
+if [[ "$DISK" =~ nvme|mmcblk ]]; then
+    PART="${DISK}p"
+else
+    PART="${DISK}"
 fi
 
 MOUNT=/mnt/droidos-install
@@ -939,54 +1087,99 @@ rm "$DONE"
 
 cleanup() {
     for d in dev/pts dev proc sys run; do umount "$MOUNT/$d" 2>/dev/null; done
-    umount "$MOUNT/boot" 2>/dev/null
-    umount "$MOUNT"      2>/dev/null
+    if [ "$BOOT_MODE" = uefi ]; then umount "$MOUNT/boot" 2>/dev/null; fi
+    umount "$MOUNT" 2>/dev/null
 }
 
 {
-    echo "5";  echo "# Partitioning $DISK..."
-    sgdisk --zap-all "$DISK"                              >> "$LOG" 2>&1 || exit 1
-    sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI"  "$DISK"   >> "$LOG" 2>&1 || exit 1
-    sgdisk -n 2:0:0     -t 2:8300 -c 2:"DroidOS" "$DISK" >> "$LOG" 2>&1 || exit 1
+    echo "5";  echo "# Partitioning $DISK ($BOOT_MODE)..."
+    sgdisk --zap-all "$DISK" >> "$LOG" 2>&1 || exit 1
+    if [ "$BOOT_MODE" = uefi ]; then
+        sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI"     "$DISK" >> "$LOG" 2>&1 || exit 1
+        sgdisk -n 2:0:0     -t 2:8300 -c 2:"DroidOS"  "$DISK" >> "$LOG" 2>&1 || exit 1
+        EFI="${PART}1"; ROOT="${PART}2"
+    else
+        # BIOS boot partition (1 MB, type ef02) required for GRUB on GPT disks.
+        sgdisk -n 1:0:+1M   -t 1:ef02 -c 1:"BIOS"    "$DISK" >> "$LOG" 2>&1 || exit 1
+        sgdisk -n 2:0:0     -t 2:8300 -c 2:"DroidOS"  "$DISK" >> "$LOG" 2>&1 || exit 1
+        ROOT="${PART}2"
+    fi
     partx --update "$DISK" >> "$LOG" 2>&1; sleep 1
 
     echo "15"; echo "# Formatting partitions..."
-    mkfs.vfat -F 32 -n EFI     "$EFI"  >> "$LOG" 2>&1 || exit 1
-    mkfs.ext4 -F    -L DroidOS "$ROOT" >> "$LOG" 2>&1 || exit 1
+    if [ "$BOOT_MODE" = uefi ]; then
+        mkfs.vfat -F 32 -n EFI "$EFI" >> "$LOG" 2>&1 || exit 1
+    fi
+    mkfs.ext4 -F -L DroidOS "$ROOT" >> "$LOG" 2>&1 || exit 1
 
     echo "20"; echo "# Mounting partitions..."
     mkdir -p "$MOUNT"
-    mount "$ROOT" "$MOUNT"       >> "$LOG" 2>&1 || exit 1
+    mount "$ROOT" "$MOUNT" >> "$LOG" 2>&1 || exit 1
     mkdir -p "$MOUNT/boot"
-    mount "$EFI"  "$MOUNT/boot" >> "$LOG" 2>&1 || exit 1
+    if [ "$BOOT_MODE" = uefi ]; then
+        mount "$EFI" "$MOUNT/boot" >> "$LOG" 2>&1 || exit 1
+    fi
 
     echo "25"; echo "# Copying system (this takes a while)..."
     rsync -a \
         --exclude=/proc --exclude=/sys --exclude=/dev \
         --exclude=/run  --exclude=/tmp --exclude=/mnt \
-        "$LIVE_ROOTFS/" "$MOUNT/"                        >> "$LOG" 2>&1 || exit 1
+        "$LIVE_ROOTFS/" "$MOUNT/" >> "$LOG" 2>&1 || exit 1
 
     echo "75"; echo "# Configuring installed system..."
     ROOT_UUID=$(findmnt -n -o UUID "$ROOT")
-    EFI_UUID=$(lsblk  -n -o UUID "$EFI")
-    printf 'UUID=%s  /      ext4  defaults   0 1\nUUID=%s  /boot  vfat  umask=0077  0 2\n' \
-        "$ROOT_UUID" "$EFI_UUID" > "$MOUNT/etc/fstab"
+    if [ "$BOOT_MODE" = uefi ]; then
+        EFI_UUID=$(lsblk -n -o UUID "$EFI")
+        printf 'UUID=%s  /      ext4  defaults    0 1\nUUID=%s  /boot  vfat  umask=0077  0 2\n' \
+            "$ROOT_UUID" "$EFI_UUID" > "$MOUNT/etc/fstab"
+    else
+        printf 'UUID=%s  /  ext4  defaults  0 1\n' "$ROOT_UUID" > "$MOUNT/etc/fstab"
+    fi
 
-    # Replace live-boot initramfs hooks with standard disk-boot hooks
-    sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect modconf block filesystems keyboard fsck)/' \
+    # No autodetect — it whitelists only modules loaded on the live ISO, which
+    # may omit disk controller drivers needed on the installed system.
+    sed -i 's/^HOOKS=.*/HOOKS=(base droidos-splash udev modconf block filesystems keyboard fsck)/' \
         "$MOUNT/etc/mkinitcpio.conf"
 
-    echo "80"; echo "# Regenerating initramfs..."
+    echo "80"; echo "# Regenerating initramfs for disk boot..."
+    # /boot is excluded from the squashfs; copy the kernel from the ISO medium.
+    cp /run/mklive/medium/boot/vmlinuz "$MOUNT/boot/vmlinuz-linux-zen" >> "$LOG" 2>&1 || exit 1
+    mkdir -p "$MOUNT"/{proc,sys,dev,dev/pts,run,tmp,mnt}
     for d in proc sys dev dev/pts run; do mount --bind "/$d" "$MOUNT/$d"; done
     chroot "$MOUNT" mkinitcpio -P >> "$LOG" 2>&1 || exit 1
 
     echo "90"; echo "# Installing bootloader..."
-    chroot "$MOUNT" grub-install \
-        --target=x86_64-efi --efi-directory=/boot \
-        --bootloader-id=DroidOS --removable         >> "$LOG" 2>&1 || exit 1
-    chroot "$MOUNT" grub-mkconfig -o /boot/grub/grub.cfg >> "$LOG" 2>&1 || exit 1
-    # Ensure grub.cfg uses the installed root UUID, not the live one
-    sed -i "s|root=UUID=[^ ]*|root=UUID=$ROOT_UUID|g" "$MOUNT/boot/grub/grub.cfg"
+    if [ "$BOOT_MODE" = uefi ]; then
+        grub-install \
+            --target=x86_64-efi \
+            --efi-directory="$MOUNT/boot" \
+            --boot-directory="$MOUNT/boot" \
+            --bootloader-id=DroidOS \
+            --removable --no-nvram >> "$LOG" 2>&1 || exit 1
+    else
+        grub-install \
+            --target=i386-pc \
+            --boot-directory="$MOUNT/boot" \
+            "$DISK" >> "$LOG" 2>&1 || exit 1
+    fi
+
+    mkdir -p "$MOUNT/boot/grub"
+    cat > "$MOUNT/boot/grub/grub.cfg" << GRUBCFG
+set timeout=5
+set default=0
+
+menuentry "DroidOS" {
+    search --no-floppy --fs-uuid --set=root $ROOT_UUID
+    linux /boot/vmlinuz-linux-zen root=UUID=$ROOT_UUID rw quiet loglevel=3 rd.udev.log_level=3 systemd.show_status=no vt.global_cursor_default=0
+    initrd /boot/initramfs-linux-zen.img
+}
+
+menuentry "DroidOS (safe mode)" {
+    search --no-floppy --fs-uuid --set=root $ROOT_UUID
+    linux /boot/vmlinuz-linux-zen root=UUID=$ROOT_UUID rw
+    initrd /boot/initramfs-linux-zen-fallback.img
+}
+GRUBCFG
 
     echo "98"; echo "# Cleaning up..."
     cleanup
@@ -1003,7 +1196,7 @@ fi
 
 rm -f "$LOG" "$DONE"
 dialog --title "DroidOS Installer" \
-    --msgbox "\nDroidOS installed successfully!\n\nRemove the USB drive and press Enter to reboot." 9 54
+    --msgbox "\nDroidOS installed successfully!\n\nPress Enter to reboot. Remove the USB drive when the BIOS screen appears." 9 60
 reboot
 INSTALLER_EOF
 chmod +x /usr/local/bin/droidos-install
@@ -1155,8 +1348,15 @@ INSTALL_EOF
 systemctl enable dhcpcd
 
 sed -i 's/^MODULES=.*/MODULES=(loop squashfs overlay iso9660 sr_mod sd_mod)/' /etc/mkinitcpio.conf
-sed -i 's/^HOOKS=.*/HOOKS=(base udev modconf block mklive)/' /etc/mkinitcpio.conf
+sed -i 's/^HOOKS=.*/HOOKS=(base droidos-splash udev modconf block mklive)/' /etc/mkinitcpio.conf
 '''
+
+# Insert the boot-screen hook right after base in the stock Arch HOOKS line.
+HARDDISK-Pre-Initramfs-Cmd = '''
+sed -i 's/^HOOKS=(base /HOOKS=(base droidos-splash /' /etc/mkinitcpio.conf
+'''
+
+Grub-Extra-Cmdline = "quiet loglevel=3 rd.udev.log_level=3 systemd.show_status=no vt.global_cursor_default=0"
 
 # Arch names its kernel and initramfs differently from Debian.
 Vmlinuz-Name = "vmlinuz-linux-zen"
