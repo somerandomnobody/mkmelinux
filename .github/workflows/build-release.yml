@@ -84,9 +84,7 @@ jobs:
 
           NOTES="Automated build from commit \`${{ github.sha }}\` on branch \`${{ github.ref_name }}\`."
           if [ -f distro/description.txt ]; then
-            NOTES="$NOTES
-
-$(cat distro/description.txt)"
+            NOTES="$NOTES"$'\n\n'"$(cat distro/description.txt)"
           fi
 
           echo "Uploading: ${UPLOADS[*]}"
