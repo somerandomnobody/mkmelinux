@@ -1,0 +1,95 @@
+[DistroInfo]
+DistroName = "Debian"
+Arch = "x64"
+Description = "Debian stable via debootstrap — the original mkmelinux base. The only template supporting V86 builds."
+Supporting = ["ISO", "HARDDISK", "V86"]
+
+[ContainerConfig]
+Packages = ["debootstrap"]
+
+# ── How this template works ───────────────────────────────────────────────────
+# This template is the old built-in Debian build of mkmelinux, extracted into
+# a distro template. The builder can map the legacy OSTYPE=MINBASE/NORMAL
+# interface onto this template as DT.DEBIAN_VARIANT.
+#
+#   * DEBIAN_VARIANT selects the debootstrap variant: NORMAL (default, full
+#     Debian base) or MINBASE (smaller, needs more setup).
+#   * V86 builds debootstrap an i386 rootfs, install a 686 kernel, and set up
+#     serial-console autologin plus the V86_SYSTEM_READY boot marker that
+#     mkv86.sh waits for during state generation. Set SKIP_BOOT_MARKER=YES to
+#     emit your own marker from extrachrootsteps.sh instead.
+#   * No Setup-Chroot-Cmd is needed: debootstrap produces a chroot that apt
+#     can run in directly, and it copies the host's resolv.conf.
+#   * ISO builds use Debian's live-boot package, which understands the
+#     "boot=live" kernel cmdline that mkmelinux writes into the GRUB config.
+
+[DistroConfig]
+
+Download-Rootfs-Cmd = '''
+echo "Getting Debian rootfs, please wait..."
+ARCH_FLAG=""
+if [ "${TYPE:-}" = "V86" ]; then
+    ARCH_FLAG="--arch=i386"
+    echo "V86 build — using 32-bit (i386) rootfs."
+fi
+if [ "${DEBIAN_VARIANT:-NORMAL}" = "MINBASE" ]; then
+    echo "Getting Minbase variant..."
+    debootstrap $ARCH_FLAG --variant=minbase stable rootfs http://deb.debian.org/debian/
+else
+    echo "Getting normal variant..."
+    debootstrap $ARCH_FLAG stable rootfs http://deb.debian.org/debian/
+fi
+'''
+
+ISO-Install-Base-Packages-Cmd = '''
+apt update
+apt install busybox linux-image-amd64 grub-pc initramfs-tools live-boot live-tools squashfs-tools systemd-sysv -y
+'''
+
+HARDDISK-Install-Base-Packages-Cmd = '''
+apt update
+apt install busybox linux-image-amd64 grub-efi systemd-sysv -y
+'''
+
+V86-Install-Base-Packages-Cmd = '''
+echo "V86 build — installing 32-bit kernel and minimal system..."
+cat > /etc/apt/sources.list << 'EOF'
+deb http://deb.debian.org/debian bookworm main
+deb http://security.debian.org/debian-security bookworm-security main
+deb http://deb.debian.org/debian bookworm-updates main
+EOF
+apt update
+apt install linux-image-686 systemd-sysv busybox -y || true
+
+echo "Adding 9p/virtio modules to initramfs for v86 filesystem support..."
+printf 'virtio_pci\n9pnet\n9pnet_virtio\n9p\n' >> /etc/initramfs-tools/modules
+
+echo "Configuring serial console autologin for state generation..."
+mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
+cat > /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf << 'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I 115200 xterm
+EOF
+systemctl enable serial-getty@ttyS0
+
+# mkv86.sh waits for the V86_SYSTEM_READY marker during state generation.
+if [ "${SKIP_BOOT_MARKER:-}" != "YES" ]; then
+    echo "Adding boot ready marker..."
+    cat >> /root/.profile << 'EOF'
+if [ -z "$V86_READY_SENT" ]; then
+    export V86_READY_SENT=1
+    sync
+    echo 'V86_SYSTEM_READY'
+fi
+EOF
+else
+    echo "Skipping automatic boot marker (SKIP_BOOT_MARKER=YES)."
+fi
+'''
+
+Regenerate-Initramfs-Cmd = "update-initramfs -u"
+
+# Vmlinuz-Name / Initramfs-Name are intentionally unset: Debian's kernel and
+# initrd filenames embed the kernel version, and the builder's default globs
+# (vmlinuz*, initrd.img*) find them.

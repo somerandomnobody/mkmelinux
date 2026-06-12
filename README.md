@@ -1,6 +1,13 @@
 # mkmelinux - a simple Linux builder.
 ![mkmelinux banner](./mkmelinux.png)
 
+---
+
+### NOTICE: Breaking changes have been introduced recently.
+mkmelinux.sh is soon going to be deprecated and mkmelinux is shifting over to Python because I felt it was the better language to code mkmelinux in. A dependency is that you need python3 installed on your system to run mkmelinux now.
+
+---
+
 mkmelinux (pronounced *make me linux*) is a simple Linux builder that can build multiple types of Distros. Useful for anyone wanting to make a quick distro without going through the pains of figuring out everything, or perhaps if you want to learn something.
 
 mkmelinux is designed to be customizable so you can make and achieve the distro you want. This is not professional software; I just made this to learn more about Linux.

@@ -135,6 +135,12 @@ export NIX_PATH="nixpkgs=${chandir}:nixos-config=/etc/nixos/mkmelinux-build.nix"
 ENV_EOF
 . /root/.mkmelinux-nix-env.sh
 
+# Remember the stock container-image closure ($sysdir still points at it —
+# no rebuild has happened yet). The GC in Regenerate-Initramfs-Cmd verifies
+# this exact path is gone before packaging. Never overwrite the marker: on a
+# reused rootfs /sbin/init already points at OUR built system.
+[ -f /root/.mkmelinux-stock-system ] || echo "$sysdir" > /root/.mkmelinux-stock-system
+
 # First-boot image: the nix database is shipped as a registration dump.
 if [ ! -e /nix/var/nix/db/db.sqlite ] && [ -f /nix-path-registration ]; then
     echo "Loading nix store database..."
@@ -279,8 +285,33 @@ set -e
 
 # Drop old container-image system generations before packaging.
 # Everything we need stays rooted: boot packages in root's nix-env profile,
-# the built system in the system profile.
-nix-collect-garbage -d || true
+# the built system in the system profile, nixpkgs in the channels profile.
+#
+# This must actually work, not best-effort: a silently failed GC once shipped
+# the stock LXC system closure (~700MB with its embedded nixpkgs copy) inside
+# the squashfs. So: clear stale auto roots first (./result symlinks left by
+# nix-build runs — none of ours, the template always uses --no-out-link),
+# GC loudly, then verify the one closure we KNOW must be gone is gone.
+rm -f /nix/var/nix/gcroots/auto/* 2>/dev/null || true
+nix-collect-garbage -d || echo "WARNING: nix-collect-garbage failed — the image may ship garbage!"
+
+# The stock closure path was recorded by the install step while /sbin/init
+# still pointed at it. Never touch it if it somehow IS the current system
+# (e.g. a reused rootfs from an older mkmelinux without the marker file).
+stock=$(cat /root/.mkmelinux-stock-system 2>/dev/null || true)
+current=$(readlink -f /nix/var/nix/profiles/system 2>/dev/null || true)
+if [ -n "$stock" ] && [ -e "$stock" ] && [ "$stock" != "$current" ]; then
+    echo "WARNING: stock container system closure survived GC, deleting explicitly..."
+    if nix-store --delete "$stock"; then
+        # Its now-unreferenced dependencies (e.g. the embedded nixpkgs tree)
+        # need a second sweep.
+        nix-collect-garbage || true
+    else
+        echo "ERROR: could not delete stale closure. Something still roots it:"
+        nix-store -q --roots "$stock" || true
+        exit 1
+    fi
+fi
 
 KERNEL_OUT=$(nix-build '<nixpkgs>' -A linuxPackages.kernel --no-out-link)
 BB_OUT=$(nix-build '<nixpkgs>' -A pkgsStatic.busybox --no-out-link)

@@ -5,8 +5,8 @@ on:
     branches: [master, main]
     paths:
       - 'distro/**'
-      - 'mkmelinux.sh'
-      - 'runinpodman.sh'
+      - 'mkmelinux.py'
+      - 'runinpodman.py'
       - 'globalpatches/**'
       - 'distro-templates/**'
   workflow_dispatch:
@@ -39,7 +39,7 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends qemu-utils zip
 
       - name: Build distro
-        run: bash runinpodman.sh
+        run: python3 runinpodman.py
 
       - name: Determine release tag
         id: tag
@@ -82,12 +82,31 @@ jobs:
             exit 1
           fi
 
+          # GitHub caps release assets at 2 GiB per file. Compressing doesn't
+          # help (the payload is already an xz squashfs), so split oversized
+          # artifacts into parts that reassemble with:  cat <name>.part-* > <name>
+          FINAL_UPLOADS=()
+          SPLIT_NOTE=""
+          for f in "${UPLOADS[@]}"; do
+            if [ "$(stat -c%s "$f")" -ge 2000000000 ]; then
+              echo "$f exceeds the 2 GiB release asset limit — splitting..."
+              split -b 1900M -d "$f" "$f.part-"
+              FINAL_UPLOADS+=("$f".part-*)
+              SPLIT_NOTE="$SPLIT_NOTE"$'\n'"- \`$(basename "$f")\` exceeds GitHub's 2 GiB asset limit and was uploaded in parts. Reassemble it with: \`cat $(basename "$f").part-* > $(basename "$f")\`"
+            else
+              FINAL_UPLOADS+=("$f")
+            fi
+          done
+
           NOTES="Automated build from commit \`${{ github.sha }}\` on branch \`${{ github.ref_name }}\`."
           if [ -f distro/description.txt ]; then
             NOTES="$NOTES"$'\n\n'"$(cat distro/description.txt)"
           fi
+          if [ -n "$SPLIT_NOTE" ]; then
+            NOTES="$NOTES"$'\n'"$SPLIT_NOTE"
+          fi
 
-          echo "Uploading: ${UPLOADS[*]}"
-          gh release create "$TAG" "${UPLOADS[@]}" \
+          echo "Uploading: ${FINAL_UPLOADS[*]}"
+          gh release create "$TAG" "${FINAL_UPLOADS[@]}" \
             --title "Build $TAG" \
             --notes "$NOTES"

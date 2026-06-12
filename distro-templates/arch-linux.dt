@@ -51,6 +51,15 @@ ISO-Install-Base-Packages-Cmd = "pacman -Sy --noconfirm linux grub squashfs-tool
 # Packages needed for a UEFI virtual-machine disk image.
 HARDDISK-Install-Base-Packages-Cmd = "pacman -Sy --noconfirm linux grub efibootmgr"
 
+# Don't ship the pacman download cache inside the image. rm instead of
+# `pacman -Scc`: --noconfirm answers its "remove ALL files?" prompt with the
+# default, which is No. Runs after extrachrootsteps so the user's extra
+# package installs are cleaned up too.
+Post-ExtraChrootSteps-Cmd = '''
+rm -rf /var/cache/pacman/pkg
+mkdir -p /var/cache/pacman/pkg
+'''
+
 # Arch uses mkinitcpio, not update-initramfs.
 Regenerate-Initramfs-Cmd = "mkinitcpio -P || true"
 

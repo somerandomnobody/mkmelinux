@@ -847,7 +847,8 @@ class OStemplateScreen(WizardPage):
     """
 
     def compose(self) -> ComposeResult:
-        templates = all_templates(config.build_type)
+        # debian.dt is represented by the hardcoded "Debian (default)" option below.
+        templates = [t for t in all_templates(config.build_type) if t["stem"] != "debian"]
         # If the previously chosen template doesn't support this build type, fall back to Debian.
         debian_selected = config.ostemplate == "" or not any(
             t["stem"] == config.ostemplate and t["supported"] for t in templates
@@ -2042,7 +2043,7 @@ class ReviewScreen(WizardPage):
             self.app.push_screen(BuildScreen(launch=False))
             return
         if event.button.id == "build":
-            self._launch_build("runinpodman.sh")
+            self._launch_build("runinpodman.py")
             return
         if event.button.id == "package_v86":
             self._launch_build("mkv86.sh")
@@ -2066,22 +2067,22 @@ class ReviewScreen(WizardPage):
     def _write_files(self) -> None:
         DISTRO_DIR.mkdir(exist_ok=True)
         args_parts = [
-            f"GENERATE_HOSTNAME={config.hostname}",
-            f"TYPE={config.build_type}",
-            "CONFIGDIR=/env/distro",
+            f"-hn {config.hostname}",
+            f"-t {config.build_type}",
+            "-c /env/distro",
+            f"-dt {config.ostemplate or 'debian'}",
         ]
-        if config.ostemplate:
-            args_parts.append(f"OSTEMPLATE={config.ostemplate}")
-        else:
-            args_parts.append(f"OSTYPE={config.ostype}")
+        if not config.ostemplate:
+            # Debian is a distro template now — the old OSTYPE became a template variable.
+            args_parts.append(f"-v DEBIAN_VARIANT={config.ostype}")
         if config.build_type == "HARDDISK":
-            args_parts.append(f"VHD_SIZE={config.vhd_size}")
+            args_parts.append(f"-vs {config.vhd_size}")
         if config.generate_new_rootfs:
-            args_parts.append("GENERATE_NEW_ROOTFS=YES")
+            args_parts.append("-newfs")
         if config.build_type == "V86" and config.v86_custom_marker:
-            args_parts.append("SKIP_BOOT_MARKER=YES")
+            args_parts.append("-sbm")
         if config.ostemplate == "droidos":
-            args_parts.append(f"DT.DROIDOS_TYPE={config.droidos_type}")
+            args_parts.append(f"-v DROIDOS_TYPE={config.droidos_type}")
         ARGUMENTS_FILE.write_text(" ".join(args_parts) + "\n")
 
         chroot_script = config.custom_script_content if config.custom_script_content else assemble_chroot_script()
@@ -2172,14 +2173,14 @@ class BuildScreen(Screen):
 
     _SPINNER_FRAMES = ["|", "/", "-", "\\"]
 
-    def __init__(self, launch: bool, script: str = "runinpodman.sh") -> None:
+    def __init__(self, launch: bool, script: str = "runinpodman.py") -> None:
         super().__init__()
         self.launch = launch
         self.script = script
 
     def compose(self) -> ComposeResult:
         yield RichLog(id="build-log", highlight=False, markup=False, wrap=True)
-        yield Static("" if self.launch else "Config saved. Run runinpodman.sh whenever you're ready.", id="build-status")
+        yield Static("" if self.launch else "Config saved. Run runinpodman.py whenever you're ready.", id="build-status")
         with Horizontal(id="btn-row"):
             yield Button("Quit", variant="primary", id="quit", disabled=self.launch)
         yield Footer()
@@ -2211,8 +2212,9 @@ class BuildScreen(Screen):
         threading.Thread(target=_cycle_quotes, daemon=True).start()
 
         master_fd, slave_fd = pty.openpty()
+        runner = "python3" if self.script.endswith(".py") else "bash"
         proc = subprocess.Popen(
-            ["bash", str(SCRIPT_DIR / self.script)],
+            [runner, str(SCRIPT_DIR / self.script)],
             cwd=str(SCRIPT_DIR),
             stdout=slave_fd,
             stderr=slave_fd,

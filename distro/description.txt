@@ -1,1 +1,1 @@
-DroidOS (Mobile) release ISO auto build.
+NixOS with a desktop.

@@ -492,9 +492,16 @@ export USER=root
 echo "[droidos-setup] Installing libhoudini (ARM support)..."
 timeout 30m ./venv/bin/python main.py install libhoudini && echo "[droidos-setup] libhoudini installed." \
     || echo "[droidos-setup] WARNING: libhoudini install failed."
-echo "[droidos-setup] Installing GApps..."
-timeout 30m ./venv/bin/python main.py install gapps && echo "[droidos-setup] GApps installed." \
-    || echo "[droidos-setup] WARNING: GApps install failed."
+# The Android TV image is a GAPPS build — adding the MindTheGapps overlay on
+# top would duplicate packages (and inflate the ISO past GitHub's 2 GiB
+# release asset limit). Only the vanilla mobile image needs GApps added.
+if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
+    echo "[droidos-setup] GAPPS image — skipping GApps overlay install."
+else
+    echo "[droidos-setup] Installing GApps..."
+    timeout 30m ./venv/bin/python main.py install gapps && echo "[droidos-setup] GApps installed." \
+        || echo "[droidos-setup] WARNING: GApps install failed."
+fi
 rm -rf /tmp/waydroid-script-cache
 '''
 
@@ -936,9 +943,16 @@ export USER=root
 echo "[droidos-setup] Installing libhoudini (ARM support)..."
 timeout 30m ./venv/bin/python main.py install libhoudini && echo "[droidos-setup] libhoudini installed." \
     || echo "[droidos-setup] WARNING: libhoudini install failed."
-echo "[droidos-setup] Installing GApps..."
-timeout 30m ./venv/bin/python main.py install gapps && echo "[droidos-setup] GApps installed." \
-    || echo "[droidos-setup] WARNING: GApps install failed."
+# The Android TV image is a GAPPS build — adding the MindTheGapps overlay on
+# top would duplicate packages (and inflate the ISO past GitHub's 2 GiB
+# release asset limit). Only the vanilla mobile image needs GApps added.
+if [ "${DROIDOS_TYPE:-MOBILE}" = "ANDROIDTV" ]; then
+    echo "[droidos-setup] GAPPS image — skipping GApps overlay install."
+else
+    echo "[droidos-setup] Installing GApps..."
+    timeout 30m ./venv/bin/python main.py install gapps && echo "[droidos-setup] GApps installed." \
+        || echo "[droidos-setup] WARNING: GApps install failed."
+fi
 rm -rf /tmp/waydroid-script-cache
 '''
 
@@ -1227,6 +1241,12 @@ PROPS_EOF
 
     echo "droidos: device props set."
 fi
+
+# Don't ship the pacman download cache inside the image (~750 MB of .pkg.tar
+# files). rm instead of `pacman -Scc`: --noconfirm answers its "remove ALL
+# files?" prompt with the default, which is No.
+rm -rf /var/cache/pacman/pkg
+mkdir -p /var/cache/pacman/pkg
 '''
 
 # Arch uses mkinitcpio, not update-initramfs.
